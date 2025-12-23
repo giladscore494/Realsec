@@ -12,7 +12,7 @@ from google.genai import types
 # ----------------------------
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 
-# שימוש במודלים מסדרת Gemini 3 Preview כפי שביקשת
+# --- החזרתי את המודלים שביקשת ---
 FLASH_MODEL = "gemini-3.0-flash-preview-05-14"
 PRO_MODEL = "gemini-3.0-pro-preview-05-14"
 
@@ -22,7 +22,6 @@ if not GEMINI_API_KEY:
 
 client = genai.Client(api_key=GEMINI_API_KEY)
 
-# מקורות לבדיקת פייק ניוז
 FACT_CHECK_SITES = [
     "FakeReporter.net", "Irrelevant.org.il", "TheWhistle (Globes)", 
     "Snopes", "Bellingcat", "CheckYourFact", "FullFact.org"
@@ -56,25 +55,24 @@ def _safe_json_loads(s: str) -> Dict[str, Any]:
 def _extract_grounding_urls(resp: Any) -> List[str]:
     urls = []
     try:
-        # חילוץ Metadata מהמודל לצורך אימות מקורות אמיתיים
-        gm = resp.candidates[0].grounding_metadata
-        if gm and gm.grounding_chunks:
-            for chunk in gm.grounding_chunks:
-                if chunk.web and chunk.web.uri:
-                    urls.append(chunk.web.uri)
+        if resp.candidates:
+            gm = resp.candidates[0].grounding_metadata
+            if gm and gm.grounding_chunks:
+                for chunk in gm.grounding_chunks:
+                    if chunk.web and chunk.web.uri:
+                        urls.append(chunk.web.uri)
     except Exception:
         pass
     return list(dict.fromkeys(urls))
 
 # ----------------------------
-# Step 1: Source Discovery (Gemini 3 Flash Preview)
+# Step 1: Source Discovery (Flash 3 Preview)
 # ----------------------------
 def run_flash_source_discovery(user_news: str, links: List[str], images: List[bytes]) -> Dict[str, Any]:
-    # כלי ה-Grounding שמאפשר למודל לחפש בזמן אמת
     search_tool = types.Tool(google_search=types.GoogleSearch())
-    
+
     prompt = f"""
-You are the Search & Source Discovery Engine (Gemini 3 Flash Preview).
+You are the Search & Source Discovery Engine (Gemini 3 Flash).
 Your goal is to find primary sources, verify claims, and check against disinformation databases.
 
 TASKS:
@@ -92,27 +90,30 @@ OUTPUT: Return a STRICT JSON object only.
 
     config = types.GenerateContentConfig(
         tools=[search_tool],
-        temperature=0.0, # מינימום יצירתיות, מקסימום עובדות
+        temperature=0.0, 
+        # הערה: אם המודל קורס, נסה למחוק את השורה הבאה
         response_mime_type="application/json",
     )
 
-    resp = client.models.generate_content(
-        model=FLASH_MODEL,
-        contents=[types.Content(role="user", parts=parts)],
-        config=config,
-    )
-
-    pkg = _safe_json_loads(resp.text)
-    pkg["verified_links"] = _extract_grounding_urls(resp)
-    return pkg
+    try:
+        resp = client.models.generate_content(
+            model=FLASH_MODEL,
+            contents=[types.Content(role="user", parts=parts)],
+            config=config,
+        )
+        pkg = _safe_json_loads(resp.text)
+        pkg["verified_links"] = _extract_grounding_urls(resp)
+        return pkg
+    except Exception as e:
+        # טיפול בשגיאות במקרה והמודל הספציפי לא זמין
+        return {"error": f"Model Error ({FLASH_MODEL}): {str(e)}", "verified_links": []}
 
 # ----------------------------
-# Step 2: Strategic Analysis (Gemini 3 Pro Preview)
+# Step 2: Strategic Analysis (Pro 3 Preview)
 # ----------------------------
 def run_pro_strategic_analysis(pkg: Dict[str, Any]) -> str:
-    # כאן המודל לא מחפש בגוגל, אלא מנתח את מה שפלאש מצא
-    system_instruction = "You are the Strategic Analyst (Gemini 3 Pro Preview). Use ONLY the provided search results to build your report."
-    
+    system_instruction = "You are a Strategic Analyst. Use ONLY the provided search results to build your report."
+
     user_prompt = f"""
 נתח את ה-Data Package הבא והפק דו"ח מודיעיני:
 {json.dumps(pkg, ensure_ascii=False)}
@@ -125,16 +126,18 @@ def run_pro_strategic_analysis(pkg: Dict[str, Any]) -> str:
 
 כתוב בעברית אנליטית ומקצועית.
 """
-
-    resp = client.models.generate_content(
-        model=PRO_MODEL,
-        contents=[types.Content(role="user", parts=[types.Part(text=user_prompt)])],
-        config=types.GenerateContentConfig(
-            system_instruction=system_instruction,
-            temperature=0.2
-        ),
-    )
-    return resp.text
+    try:
+        resp = client.models.generate_content(
+            model=PRO_MODEL,
+            contents=[types.Content(role="user", parts=[types.Part(text=user_prompt)])],
+            config=types.GenerateContentConfig(
+                system_instruction=system_instruction,
+                temperature=0.2
+            ),
+        )
+        return resp.text
+    except Exception as e:
+        return f"שגיאה בניתוח הפרו ({PRO_MODEL}): {str(e)}"
 
 # ----------------------------
 # Streamlit Interface
@@ -142,13 +145,11 @@ def run_pro_strategic_analysis(pkg: Dict[str, Any]) -> str:
 st.set_page_config(page_title="Gemini 3 OSINT", layout="wide")
 
 st.title("🛡️ Gemini 3 OSINT Engine")
-st.subheader("Flash 3 (Discovery) → Pro 3 (Analysis)")
+st.subheader(f"Models: {FLASH_MODEL} → {PRO_MODEL}")
 
 with st.sidebar:
     st.header("מקורות בדיקה")
     st.write(FACT_CHECK_SITES)
-    st.divider()
-    st.caption("מבוסס על מודלי Preview מסדרת Gemini 3")
 
 col1, col2 = st.columns([1, 1])
 
@@ -159,7 +160,7 @@ with col1:
 with col2:
     uploaded = st.file_uploader("העלה תמונות / סקרינשוטים:", type=["png", "jpg", "jpeg"], accept_multiple_files=True)
 
-if st.button("בצע חקירה רב-שכבתית", type="primary", use_container_width=True):
+if st.button("בצע חקירה (Gemini 3 Preview)", type="primary", use_container_width=True):
     if not user_text and not uploaded:
         st.error("יש להזין קלט כלשהו.")
     else:
@@ -167,10 +168,15 @@ if st.button("בצע חקירה רב-שכבתית", type="primary", use_containe
         imgs = [f.read() for f in uploaded] if uploaded else []
 
         with st.status("מפעיל סוכני Gemini 3...") as status:
-            st.write("🕵️ פלאש 3 סורק מקורות ו-Grounding...")
+            st.write(f"🕵️ {FLASH_MODEL} סורק מקורות...")
             data_package = run_flash_source_discovery(user_text, links, imgs)
             
-            st.write("📊 פרו 3 מנתח אסטרטגיה ותרחישים...")
+            # בדיקה אם הייתה שגיאה בשלב הראשון
+            if "error" in data_package and "verified_links" not in data_package:
+                 st.error(data_package["error"])
+                 st.stop()
+
+            st.write(f"📊 {PRO_MODEL} מנתח אסטרטגיה...")
             final_report = run_pro_strategic_analysis(data_package)
             
             status.update(label="הניתוח הושלם", state="complete")
