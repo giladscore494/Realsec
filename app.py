@@ -12,9 +12,9 @@ from google.genai import types
 # ----------------------------
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 
-# --- החזרתי את המודלים שביקשת ---
-FLASH_MODEL = "gemini-3.0-flash-preview-05-14"
-PRO_MODEL = "gemini-3.0-pro-preview-05-14"
+# הגדרת המודלים בדיוק כפי שביקשת
+FLASH_MODEL = os.getenv("FLASH_MODEL", "gemini-3-flash-preview")
+PRO_MODEL   = os.getenv("PRO_MODEL",   "gemini-3-pro-preview")
 
 if not GEMINI_API_KEY:
     st.error("Missing GEMINI_API_KEY. Please set it in your environment.")
@@ -22,6 +22,7 @@ if not GEMINI_API_KEY:
 
 client = genai.Client(api_key=GEMINI_API_KEY)
 
+# רשימת מקורות לניטור פייק ניוז
 FACT_CHECK_SITES = [
     "FakeReporter.net", "Irrelevant.org.il", "TheWhistle (Globes)", 
     "Snopes", "Bellingcat", "CheckYourFact", "FullFact.org"
@@ -41,15 +42,20 @@ def _clean_links(raw: str) -> List[str]:
 
 def _safe_json_loads(s: str) -> Dict[str, Any]:
     s = (s or "").strip()
+    # הסרת סממני Markdown אם קיימים
     if s.startswith("```"):
         s = re.sub(r"^```[a-zA-Z]*\s*", "", s)
         s = re.sub(r"\s*```$", "", s).strip()
     try:
         return json.loads(s)
     except json.JSONDecodeError:
+        # ניסיון חילוץ JSON מתוך טקסט חופשי
         m = re.search(r"(\{.*\})", s, re.DOTALL)
         if m:
-            return json.loads(m.group(1))
+            try:
+                return json.loads(m.group(1))
+            except:
+                pass
         return {"error": "Failed to parse JSON", "raw": s}
 
 def _extract_grounding_urls(resp: Any) -> List[str]:
@@ -66,13 +72,13 @@ def _extract_grounding_urls(resp: Any) -> List[str]:
     return list(dict.fromkeys(urls))
 
 # ----------------------------
-# Step 1: Source Discovery (Flash 3 Preview)
+# Step 1: Source Discovery (Flash Model)
 # ----------------------------
 def run_flash_source_discovery(user_news: str, links: List[str], images: List[bytes]) -> Dict[str, Any]:
     search_tool = types.Tool(google_search=types.GoogleSearch())
 
     prompt = f"""
-You are the Search & Source Discovery Engine (Gemini 3 Flash).
+You are the Search & Source Discovery Engine (Running on {FLASH_MODEL}).
 Your goal is to find primary sources, verify claims, and check against disinformation databases.
 
 TASKS:
@@ -91,8 +97,7 @@ OUTPUT: Return a STRICT JSON object only.
     config = types.GenerateContentConfig(
         tools=[search_tool],
         temperature=0.0, 
-        # הערה: אם המודל קורס, נסה למחוק את השורה הבאה
-        response_mime_type="application/json",
+        response_mime_type="application/json", 
     )
 
     try:
@@ -105,11 +110,11 @@ OUTPUT: Return a STRICT JSON object only.
         pkg["verified_links"] = _extract_grounding_urls(resp)
         return pkg
     except Exception as e:
-        # טיפול בשגיאות במקרה והמודל הספציפי לא זמין
-        return {"error": f"Model Error ({FLASH_MODEL}): {str(e)}", "verified_links": []}
+        # החזרת שגיאה מפורטת במידה והמודל לא נמצא
+        return {"error": f"Flash Model Error ({FLASH_MODEL}): {str(e)}", "verified_links": []}
 
 # ----------------------------
-# Step 2: Strategic Analysis (Pro 3 Preview)
+# Step 2: Strategic Analysis (Pro Model)
 # ----------------------------
 def run_pro_strategic_analysis(pkg: Dict[str, Any]) -> str:
     system_instruction = "You are a Strategic Analyst. Use ONLY the provided search results to build your report."
@@ -137,7 +142,7 @@ def run_pro_strategic_analysis(pkg: Dict[str, Any]) -> str:
         )
         return resp.text
     except Exception as e:
-        return f"שגיאה בניתוח הפרו ({PRO_MODEL}): {str(e)}"
+        return f"Pro Model Error ({PRO_MODEL}): {str(e)}"
 
 # ----------------------------
 # Streamlit Interface
@@ -145,11 +150,18 @@ def run_pro_strategic_analysis(pkg: Dict[str, Any]) -> str:
 st.set_page_config(page_title="Gemini 3 OSINT", layout="wide")
 
 st.title("🛡️ Gemini 3 OSINT Engine")
-st.subheader(f"Models: {FLASH_MODEL} → {PRO_MODEL}")
+st.caption(f"Configured Models: Flash='{FLASH_MODEL}' | Pro='{PRO_MODEL}'")
 
 with st.sidebar:
     st.header("מקורות בדיקה")
     st.write(FACT_CHECK_SITES)
+    st.divider()
+    if st.button("בדוק מודלים זמינים בחשבון"):
+        try:
+            models = client.models.list_models()
+            st.write([m.name for m in models])
+        except Exception as e:
+            st.error(f"Error listing models: {e}")
 
 col1, col2 = st.columns([1, 1])
 
@@ -160,35 +172,40 @@ with col1:
 with col2:
     uploaded = st.file_uploader("העלה תמונות / סקרינשוטים:", type=["png", "jpg", "jpeg"], accept_multiple_files=True)
 
-if st.button("בצע חקירה (Gemini 3 Preview)", type="primary", use_container_width=True):
+if st.button("בצע חקירה רב-שכבתית", type="primary", use_container_width=True):
     if not user_text and not uploaded:
         st.error("יש להזין קלט כלשהו.")
     else:
         links = _clean_links(user_links)
         imgs = [f.read() for f in uploaded] if uploaded else []
 
-        with st.status("מפעיל סוכני Gemini 3...") as status:
-            st.write(f"🕵️ {FLASH_MODEL} סורק מקורות...")
+        with st.status(f"מפעיל את {FLASH_MODEL} ו-{PRO_MODEL}...") as status:
+            
+            # שלב 1: Flash
+            st.write(f"🕵️ מפעיל Source Discovery ({FLASH_MODEL})...")
             data_package = run_flash_source_discovery(user_text, links, imgs)
             
-            # בדיקה אם הייתה שגיאה בשלב הראשון
-            if "error" in data_package and "verified_links" not in data_package:
-                 st.error(data_package["error"])
-                 st.stop()
+            # בדיקת שגיאות קריטית
+            if "error" in data_package and not data_package.get("verified_links"):
+                st.error(f"תקלה בשלב ה-Flash: {data_package['error']}")
+                st.stop()
 
-            st.write(f"📊 {PRO_MODEL} מנתח אסטרטגיה...")
+            # שלב 2: Pro
+            st.write(f"📊 מפעיל Strategic Analysis ({PRO_MODEL})...")
             final_report = run_pro_strategic_analysis(data_package)
             
             status.update(label="הניתוח הושלם", state="complete")
 
-        # UI התרעה על פייק ניוז
+        # UI: התרעת פייק ניוז
         is_fake = data_package.get("known_hoax_check", {}).get("is_known_fake", False)
         if is_fake:
             st.error(f"🛑 **אזהרה:** המידע זוהה כפייק ניוז: {data_package['known_hoax_check'].get('details')}")
 
+        # UI: הצגת הדו"ח
         st.markdown("### 📋 דו\"ח ניתוח סופי")
         st.markdown(final_report)
 
+        # UI: הרחבות (Expanders)
         with st.expander("🔗 לינקים שאומתו בחיפוש"):
             for l in data_package.get("verified_links", []):
                 st.write(f"- {l}")
