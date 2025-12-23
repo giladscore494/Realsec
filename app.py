@@ -1,31 +1,7 @@
-# app.py
-# ==========================================
-# Gemini Grounded Verifier (1 grounded call -> 1 Pro analysis call)
-# Streamlit UI: user can paste text + links + upload screenshots
-#
-# Flow:
-# 1) Gemini "Flash" WITH google_search tool (grounding) runs ONCE:
-#    - reads user text + screenshots (vision) + links
-#    - searches web (grounding) as needed
-#    - returns STRICT JSON: claims, keywords, evidence bullets, and a compact "pro_prompt"
-#    - (optionally) includes citations URLs extracted from groundingMetadata
-# 2) Gemini "Pro" WITHOUT tools:
-#    - receives the JSON package as input
-#    - outputs up to ONE paragraph in Hebrew
-#
-# Requirements:
-#   pip install streamlit google-genai
-# Env:
-#   export GEMINI_API_KEY="..."
-# Optional:
-#   export FLASH_MODEL="gemini-2.5-flash"
-#   export PRO_MODEL="gemini-2.5-pro"
-# ==========================================
-
 import os
 import json
 import re
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 import streamlit as st
 from google import genai
@@ -36,8 +12,8 @@ from google.genai import types
 # Config
 # ----------------------------
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-FLASH_MODEL = os.getenv("FLASH_MODEL", "gemini-2.5-flash")
-PRO_MODEL = os.getenv("PRO_MODEL", "gemini-2.5-pro")
+FLASH_MODEL = os.getenv("FLASH_MODEL", "gemini-3-flash-preview")
+PRO_MODEL = os.getenv("PRO_MODEL", "gemini-3-pro-preview")
 
 if not GEMINI_API_KEY:
     raise RuntimeError("Missing GEMINI_API_KEY env var.")
@@ -49,28 +25,20 @@ client = genai.Client(api_key=GEMINI_API_KEY)
 # Utilities
 # ----------------------------
 def _clean_links(raw: str) -> List[str]:
-    if not raw.strip():
-        return []
-    # Extract URLs from any pasted text
-    urls = re.findall(r"https?://[^\s)>\]]+", raw)
-    # Dedup while preserving order
-    out = []
-    seen = set()
+    urls = re.findall(r"https?://[^\s)>\]]+", raw or "")
+    out, seen = [], set()
     for u in urls:
         if u not in seen:
             seen.add(u)
             out.append(u)
-    return out[:15]
+    return out[:20]
 
 
 def _safe_json_loads(s: str) -> Dict[str, Any]:
-    # Strict JSON expected. If the model wraps it, try to extract.
-    s = s.strip()
+    s = (s or "").strip()
     if s.startswith("```"):
         s = re.sub(r"^```[a-zA-Z]*\s*", "", s)
-        s = re.sub(r"\s*```$", "", s)
-        s = s.strip()
-    # Extract first {...} block if needed
+        s = re.sub(r"\s*```$", "", s).strip()
     if not s.startswith("{"):
         m = re.search(r"(\{.*\})", s, re.DOTALL)
         if m:
@@ -78,98 +46,129 @@ def _safe_json_loads(s: str) -> Dict[str, Any]:
     return json.loads(s)
 
 
-def _extract_grounding_urls(resp: Any) -> List[Dict[str, str]]:
-    """
-    Pull URLs/titles from groundingMetadata if present.
-    The exact shape can vary; keep it defensive.
-    """
-    out: List[Dict[str, str]] = []
+def _extract_grounding_urls(resp: Any) -> List[str]:
+    urls: List[str] = []
     try:
         cand0 = resp.candidates[0]
         gm = getattr(cand0, "grounding_metadata", None) or getattr(cand0, "groundingMetadata", None)
         if not gm:
-            return out
-
-        # groundingChunks often contains web entries
+            return []
         chunks = getattr(gm, "grounding_chunks", None) or getattr(gm, "groundingChunks", None) or []
         for ch in chunks:
             web = getattr(ch, "web", None) or {}
-            uri = getattr(web, "uri", None) or web.get("uri")
-            title = getattr(web, "title", None) or web.get("title")
+            uri = getattr(web, "uri", None) or (web.get("uri") if isinstance(web, dict) else None)
             if uri:
-                out.append({"title": title or "", "url": uri})
-
-        # Dedup
-        dedup = []
-        seen = set()
-        for item in out:
-            if item["url"] not in seen:
-                seen.add(item["url"])
-                dedup.append(item)
-        return dedup[:20]
+                urls.append(uri)
     except Exception:
         return []
+    # dedup
+    out, seen = [], set()
+    for u in urls:
+        if u not in seen:
+            seen.add(u)
+            out.append(u)
+    return out[:30]
 
 
 # ----------------------------
-# Gemini Calls
+# Flash (Grounded) - OSINT package builder
 # ----------------------------
-def flash_grounded_package(user_news: str, links: List[str], images: List[bytes]) -> Dict[str, Any]:
+def flash_grounded_osint_package(user_news: str, links: List[str], images: List[bytes]) -> Dict[str, Any]:
     grounding_tool = types.Tool(google_search=types.GoogleSearch())
     config = types.GenerateContentConfig(
         tools=[grounding_tool],
         temperature=0.2,
     )
 
-    # Build multimodal parts: text + images
-    parts: List[types.Part] = []
+    osint_buckets = [
+        "official_primary",     # official statements, govt/military/police/emergency
+        "major_media",          # Reuters/AP/BBC etc. + large national outlets
+        "geoint",               # satellite imagery / geolocation corroboration if relevant
+        "aviation",             # NOTAM/airspace closures/flight disruptions if relevant
+        "maritime",             # port disruptions/AIS anomalies if relevant
+        "event_monitors",       # incident trackers/monitor orgs
+        "media_verification",   # prior appearance, edits, mismatch checks
+        "expert_context"        # credible analysts/think tanks (flag as "analysis", not "fact")
+    ]
 
-    # Core prompt: force JSON only
     prompt = f"""
-You are a verification pipeline. Produce STRICT JSON only (no markdown).
+You are an OSINT verification engine. You have Google Search grounding enabled in THIS call.
+You must search in BOTH Hebrew and English.
 
 Goal:
-- Given: user-submitted "news items" about a security situation, plus optional links and screenshots.
-- You may use Google Search grounding (enabled) inside THIS single call.
-- Output a compact evidence package to be analyzed later by another model WITHOUT any browsing.
+- Extract distinct factual claims from user input (text + screenshots + links).
+- For each claim, perform OSINT-style cross-checking using the buckets below,
+  even if the user provided a low-quality source.
+
+OSINT buckets (you MUST attempt coverage where relevant):
+{osint_buckets}
 
 Hard rules:
-- Output MUST be valid JSON.
-- Do not include any extra keys outside the schema below.
-- Use cautious language. If evidence is insufficient: mark as "unclear".
-- Do NOT invent sources. Use only what you actually saw via grounding or user-provided links.
-- If screenshots contain text, extract the text and treat it as a claim input (not as proof).
+- Output STRICT JSON only (no markdown, no extra commentary).
+- Do not invent sources. Only cite URLs you actually got from grounded search.
+- User screenshots are INPUT (claims), not proof.
+- For each claim, generate: (1) Hebrew queries list, (2) English queries list
+  that explicitly target OSINT buckets (official/major media/etc.).
+- If a bucket is not relevant to the claim, mark it "not_relevant" with a short reason.
+- Evidence must be short paraphrases (no long quotes).
+- If sources conflict, you must mark conflicts_found=true and describe the conflict.
 
-Schema:
+Schema (output exactly this structure, no extra keys):
 {{
   "input_summary": {{
     "user_items_short": "...",
-    "links_seen": ["..."],
+    "user_links": ["..."],
     "screenshots_count": 0
   }},
   "claims": [
     {{
       "id": "c1",
       "claim": "1 sentence, checkable",
-      "keywords": ["...","..."],
+      "keywords": ["..."],
       "time_place_entities": {{
         "time": ["..."],
         "place": ["..."],
         "entities": ["..."]
       }},
-      "grounded_evidence_bullets": [
+      "osint_search_plan": {{
+        "he_queries": ["..."],
+        "en_queries": ["..."],
+        "bucket_targets": {{
+          "official_primary": "must_try | not_relevant",
+          "major_media": "must_try | not_relevant",
+          "geoint": "must_try | not_relevant",
+          "aviation": "must_try | not_relevant",
+          "maritime": "must_try | not_relevant",
+          "event_monitors": "must_try | not_relevant",
+          "media_verification": "must_try | not_relevant",
+          "expert_context": "must_try | not_relevant"
+        }}
+      }},
+      "evidence": [
         {{
-          "support": "supports | contradicts | weak | unclear",
+          "bucket": "official_primary | major_media | geoint | aviation | maritime | event_monitors | media_verification | expert_context",
+          "stance": "supports | contradicts | weak | unclear",
           "source_title": "...",
           "source_url": "...",
-          "what_it_says": "short paraphrase (no long quotes)"
+          "what_it_says": "short paraphrase",
+          "is_fact_or_analysis": "fact | analysis"
         }}
       ],
       "credibility_signals": {{
         "independent_sources_count": 0,
-        "has_primary_or_official": true,
-        "has_major_outlets": true,
-        "conflicts_found": false
+        "has_primary_or_official": false,
+        "has_major_outlets": false,
+        "conflicts_found": false,
+        "evidence_bucket_coverage": {{
+          "official_primary": "covered | missing | not_relevant",
+          "major_media": "covered | missing | not_relevant",
+          "geoint": "covered | missing | not_relevant",
+          "aviation": "covered | missing | not_relevant",
+          "maritime": "covered | missing | not_relevant",
+          "event_monitors": "covered | missing | not_relevant",
+          "media_verification": "covered | missing | not_relevant",
+          "expert_context": "covered | missing | not_relevant"
+        }}
       }},
       "preliminary_likelihood": {{
         "label": "likely_true | unclear | likely_false",
@@ -178,32 +177,35 @@ Schema:
       }}
     }}
   ],
+  "scenario_candidates": [
+    {{
+      "scenario": "a plausible scenario derived from the claims (neutral wording)",
+      "key_drivers": ["..."],
+      "what_would_confirm": ["..."],
+      "what_would_falsify": ["..."]
+    }}
+  ],
   "global_notes": {{
     "what_is_most_solid": ["..."],
     "what_is_most_uncertain": ["..."],
     "missing_checks": ["..."]
   }},
   "pro_prompt": {{
-    "system": "You are an evidence-based analyst. Do not browse. Use only provided package.",
-    "user": "A compact instruction + all evidence needed. Keep it short but complete."
+    "system": "You are an evidence-based analyst. Do not browse. Use only the provided package.",
+    "user": "Instructions for Pro: evaluate overall truth-likelihood AND estimate scenario probabilities by time horizon."
   }}
 }}
 
 User news text:
 {user_news}
 
-User links (may be empty):
+User links:
 {links}
 """.strip()
 
-    parts.append(types.Part(text=prompt))
-
+    parts: List[types.Part] = [types.Part(text=prompt)]
     for img_bytes in images[:8]:
-        parts.append(
-            types.Part(
-                inline_data=types.Blob(mime_type="image/png", data=img_bytes)
-            )
-        )
+        parts.append(types.Part(inline_data=types.Blob(mime_type="image/png", data=img_bytes)))
 
     resp = client.models.generate_content(
         model=FLASH_MODEL,
@@ -212,55 +214,60 @@ User links (may be empty):
     )
 
     pkg = _safe_json_loads(resp.text)
-    # Optionally enrich with grounding URLs (not changing schema; so we only merge into links_seen if empty)
-    grounding_urls = _extract_grounding_urls(resp)
-    if grounding_urls:
-        # Keep schema: links_seen is list[str]
-        extra = [u["url"] for u in grounding_urls if u.get("url")]
-        seen = set(pkg["input_summary"].get("links_seen", []))
-        merged = pkg["input_summary"].get("links_seen", [])
-        for u in extra:
+
+    # merge extra grounded urls into input_summary.user_links (still within schema list[str])
+    grounded_urls = _extract_grounding_urls(resp)
+    if grounded_urls:
+        existing = pkg["input_summary"].get("user_links", []) or []
+        seen = set(existing)
+        for u in grounded_urls:
             if u not in seen:
                 seen.add(u)
-                merged.append(u)
-        pkg["input_summary"]["links_seen"] = merged[:25]
+                existing.append(u)
+        pkg["input_summary"]["user_links"] = existing[:30]
+
     return pkg
 
 
-def pro_analyze_package(pkg: Dict[str, Any]) -> str:
-    # Pro call WITHOUT tools: no google_search tool in config.
-    config = types.GenerateContentConfig(
-        temperature=0.2,
-        # explicitly no tools here
-    )
+# ----------------------------
+# Pro (No tools) - final analysis + time-horizon probabilities
+# ----------------------------
+def pro_analyze_osint_package(pkg: Dict[str, Any]) -> str:
+    config = types.GenerateContentConfig(temperature=0.2)
 
-    pro_system = pkg["pro_prompt"]["system"]
-    pro_user = pkg["pro_prompt"]["user"]
-
-    # Make Pro's user message include the whole package (but compact).
+    # Force a specific output structure from Pro (text only displayed to user)
     payload = {
-        "instruction": pro_user,
         "package": {
             "input_summary": pkg.get("input_summary", {}),
             "claims": pkg.get("claims", []),
+            "scenario_candidates": pkg.get("scenario_candidates", []),
             "global_notes": pkg.get("global_notes", {}),
         },
-        "output_requirements": {
+        "output_rules": {
             "language": "Hebrew",
-            "format": "ONE paragraph only",
-            "max_length": "about 6-8 lines",
-            "must_include": [
-                "overall likelihood summary",
-                "top 1-2 strongest supports",
-                "top 1-2 biggest uncertainties"
-            ],
-        },
+            "do_not_browse": True,
+            "no_new_facts": True,
+            "must_be_grounded_in_package": True,
+            "format": {
+                "part_1": "ONE paragraph summary (6-10 lines) about truth-likelihood & evidence quality",
+                "part_2": "Time-horizon scenario probabilities table",
+            },
+            "probability_table": {
+                "horizons": ["1_month", "3_months", "6_months", "12_months"],
+                "scale": "0-100",
+                "requirements": [
+                    "give probabilities for each scenario in scenario_candidates",
+                    "briefly justify with 1 short clause per scenario (based on evidence/drivers)",
+                    "if evidence is weak -> keep probabilities conservative and say why"
+                ]
+            }
+        }
     }
 
     resp = client.models.generate_content(
         model=PRO_MODEL,
         contents=[
-            types.Content(role="system", parts=[types.Part(text=pro_system)]),
+            types.Content(role="system", parts=[types.Part(text=pkg["pro_prompt"]["system"])]),
             types.Content(role="user", parts=[types.Part(text=json.dumps(payload, ensure_ascii=False))]),
         ],
         config=config,
@@ -271,37 +278,24 @@ def pro_analyze_package(pkg: Dict[str, Any]) -> str:
 # ----------------------------
 # Streamlit UI
 # ----------------------------
-st.set_page_config(page_title="Security Claim Verifier", layout="wide")
-
-st.title("בודק אמינות ידיעות (Grounding פעם אחת -> ניתוח Pro בלי חיפוש)")
-
-with st.expander("הגדרות (אופציונלי)"):
-    st.write(f"Flash model: `{FLASH_MODEL}`")
-    st.write(f"Pro model: `{PRO_MODEL}`")
+st.set_page_config(page_title="OSINT Verifier", layout="wide")
+st.title("OSINT מנתח מקורות (Grounding פעם אחת → Pro בלי חיפוש + הסתברויות תרחישים)")
 
 col1, col2 = st.columns([1, 1])
 
 with col1:
-    user_news = st.text_area(
-        "הדבק פה את הידיעות/טענות (טקסט חופשי):",
-        height=220,
-        placeholder="לדוגמה: 'מקור X טוען ש...'\n'דיווח נוסף אומר ש...'",
-    )
-    links_text = st.text_area(
-        "הדבק פה קישורים לכתבות (אפשר גם יחד עם טקסט):",
-        height=120,
-        placeholder="https://...\nhttps://...",
-    )
+    user_news = st.text_area("הדבק ידיעות/טענות:", height=220)
+    links_text = st.text_area("הדבק קישורים (אפשר גם מעורב עם טקסט):", height=120)
 
 with col2:
     uploaded = st.file_uploader(
-        "העלה תצלומי מסך (PNG/JPG) שמכילים טקסט/כותרות:",
+        "העלה תצלומי מסך (PNG/JPG):",
         type=["png", "jpg", "jpeg"],
         accept_multiple_files=True,
     )
-    st.caption("הסקרינשוטים משמשים כקלט לטענות. הם לא 'הוכחה' בפני עצמם.")
+    st.caption("הסקרינשוטים משמשים כקלט לטענות; האימות נעשה מול OSINT באינטרנט.")
 
-run_btn = st.button("בדוק אמינות", type="primary", use_container_width=True)
+run_btn = st.button("הרץ ניתוח OSINT", type="primary", use_container_width=True)
 
 if run_btn:
     if not (user_news.strip() or links_text.strip() or uploaded):
@@ -309,34 +303,31 @@ if run_btn:
         st.stop()
 
     links = _clean_links(links_text)
-    images_bytes: List[bytes] = []
-    if uploaded:
-        for f in uploaded:
-            images_bytes.append(f.read())
+    images = [f.read() for f in uploaded] if uploaded else []
 
-    with st.spinner("שלב 1/2: איסוף ראיות עם Grounding (Flash) ..."):
+    with st.spinner("שלב 1/2: Grounding + OSINT חיפוש דו-לשוני (Flash) ..."):
         try:
-            pkg = flash_grounded_package(user_news=user_news, links=links, images=images_bytes)
+            pkg = flash_grounded_osint_package(user_news=user_news, links=links, images=images)
         except Exception as e:
             st.error(f"שגיאה בשלב ה-Grounding: {e}")
             st.stop()
 
-    with st.spinner("שלב 2/2: ניתוח ללא חיפוש (Pro) ..."):
+    with st.spinner("שלב 2/2: ניתוח תרחישים והסתברויות (Pro ללא חיפוש) ..."):
         try:
-            final_text = pro_analyze_package(pkg)
+            final_text = pro_analyze_osint_package(pkg)
         except Exception as e:
             st.error(f"שגיאה בשלב הניתוח: {e}")
             st.stop()
 
-    st.subheader("סיכום למשתמש")
+    st.subheader("תוצאה למשתמש")
     st.write(final_text)
 
-    with st.expander("מה נאסף (JSON שנשלח ל-Pro)"):
+    with st.expander("JSON שנשלח ל-Pro (Debug)"):
         st.json(pkg)
 
-    # Quick view of sources that were seen
-    links_seen = pkg.get("input_summary", {}).get("links_seen", []) or []
-    if links_seen:
-        st.subheader("מקורות שנראו (לינקים)")
-        for u in links_seen[:25]:
+    # quick sources list
+    srcs = pkg.get("input_summary", {}).get("user_links", []) or []
+    if srcs:
+        st.subheader("מקורות/לינקים שנאספו (Grounding)")
+        for u in srcs[:30]:
             st.write(f"- {u}")
