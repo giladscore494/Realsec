@@ -1,6 +1,7 @@
 import os
 import json
 import re
+import datetime
 from typing import Any, Dict, List
 
 import streamlit as st
@@ -12,7 +13,7 @@ from google.genai import types
 # ----------------------------
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 
-# הגדרת המודלים בדיוק כפי שביקשת
+# מודלים
 FLASH_MODEL = os.getenv("FLASH_MODEL", "gemini-3-flash-preview")
 PRO_MODEL   = os.getenv("PRO_MODEL",   "gemini-3-pro-preview")
 
@@ -25,7 +26,7 @@ client = genai.Client(api_key=GEMINI_API_KEY)
 # רשימת מקורות לניטור פייק ניוז
 FACT_CHECK_SITES = [
     "FakeReporter.net", "Irrelevant.org.il", "TheWhistle (Globes)", 
-    "Snopes", "Bellingcat", "CheckYourFact", "FullFact.org"
+    "Snopes", "Bellingcat", "CheckYourFact", "FullFact.org", "Abu Ali Express"
 ]
 
 # ----------------------------
@@ -42,14 +43,12 @@ def _clean_links(raw: str) -> List[str]:
 
 def _safe_json_loads(s: str) -> Dict[str, Any]:
     s = (s or "").strip()
-    # הסרת סממני Markdown אם קיימים
     if s.startswith("```"):
         s = re.sub(r"^```[a-zA-Z]*\s*", "", s)
         s = re.sub(r"\s*```$", "", s).strip()
     try:
         return json.loads(s)
     except json.JSONDecodeError:
-        # ניסיון חילוץ JSON מתוך טקסט חופשי
         m = re.search(r"(\{.*\})", s, re.DOTALL)
         if m:
             try:
@@ -72,31 +71,58 @@ def _extract_grounding_urls(resp: Any) -> List[str]:
     return list(dict.fromkeys(urls))
 
 # ----------------------------
-# Step 1: Source Discovery (Flash Model)
+# Step 1: Source Discovery (Flash Model - HARD SIGNALS & OSINT)
 # ----------------------------
 def run_flash_source_discovery(user_news: str, links: List[str], images: List[bytes]) -> Dict[str, Any]:
     search_tool = types.Tool(google_search=types.GoogleSearch())
+    
+    current_date = datetime.datetime.now().strftime("%Y-%m-%d")
 
+    # פרומפט משודרג עם התמקדות ב"סימנים מעידים" (Hard Indicators)
     prompt = f"""
-You are the Search & Source Discovery Engine (Running on {FLASH_MODEL}).
-Your goal is to find primary sources, verify claims, and check against disinformation databases.
+You are an Elite Military Intelligence Collector (OSINT) running on {FLASH_MODEL}.
+Current Date: {current_date}.
 
-TASKS:
-1. IMAGE ANALYSIS: Extract text/OCR and describe visual evidence.
-2. DUAL-LANGUAGE SEARCH: Search in Hebrew and English.
-3. FAKE NEWS FILTER: Explicitly check if these claims appear on: {FACT_CHECK_SITES}.
-4. BUCKET CLASSIFICATION: Group findings into: Official, Media, Geolocation, and Expert Analysis.
+YOUR MISSION: Validate the event and collect "Hard Signals" (Indicators & Warnings).
+Do not just look for headlines. Look for LOGISTICS and PHYSICAL movements.
 
-OUTPUT: Return a STRICT JSON object only.
+SEARCH STRATEGY (Force these queries):
+1.  **Social Media**: Use `site:twitter.com` and `site:t.me` to find real-time reports.
+2.  **Hard Indicators**:
+    -   GPS Jamming reports (Waze/Maps anomalies).
+    -   Hospital preparations (transfer to underground wards).
+    -   Flight restrictions (NOTAMs).
+    -   Reserve call-ups (Tzav 8).
+    -   Embassy warnings / Evacuations.
+
+OUTPUT FORMAT (STRICT JSON):
+{{
+  "event_summary": "Concise summary of the situation",
+  "hard_indicators": {{
+      "logistics_status": "Description of supply/hospital/transport status found",
+      "military_movements": "Description of any troop/tank/plane movements reported",
+      "civilian_impact": "GPS jamming, school cancellations, etc."
+  }},
+  "social_media_intel": {{
+      "telegram_chatter": ["Specific claims from Telegram"],
+      "twitter_signals": ["Specific claims from X"]
+  }},
+  "source_reliability": "High/Medium/Low based on cross-referencing",
+  "contradictions": ["List if official news contradicts social media"],
+  "known_hoax_check": {{
+      "is_fake": boolean,
+      "details": "Explanation if fake"
+  }}
+}}
 """
 
-    parts = [types.Part(text=prompt), types.Part(text=f"Text: {user_news}\nLinks: {links}")]
+    parts = [types.Part(text=prompt), types.Part(text=f"Subject to Investigate: {user_news}\nLinks provided: {links}")]
     for img in images[:8]:
         parts.append(types.Part(inline_data=types.Blob(mime_type="image/png", data=img)))
 
     config = types.GenerateContentConfig(
         tools=[search_tool],
-        temperature=0.0, 
+        temperature=0.0, # אפס יצירתיות, רק עובדות
         response_mime_type="application/json", 
     )
 
@@ -110,26 +136,45 @@ OUTPUT: Return a STRICT JSON object only.
         pkg["verified_links"] = _extract_grounding_urls(resp)
         return pkg
     except Exception as e:
-        # החזרת שגיאה מפורטת במידה והמודל לא נמצא
-        return {"error": f"Flash Model Error ({FLASH_MODEL}): {str(e)}", "verified_links": []}
+        return {"error": f"Flash Model Error: {str(e)}", "verified_links": []}
 
 # ----------------------------
-# Step 2: Strategic Analysis (Pro Model)
+# Step 2: Strategic Analysis (Pro Model - ACH METHODOLOGY)
 # ----------------------------
 def run_pro_strategic_analysis(pkg: Dict[str, Any]) -> str:
-    system_instruction = "You are a Strategic Analyst. Use ONLY the provided search results to build your report."
+    system_instruction = "You are a Senior Intelligence Assessment Officer using the 'Analysis of Competing Hypotheses' (ACH) method."
 
     user_prompt = f"""
-נתח את ה-Data Package הבא והפק דו"ח מודיעיני:
+נתח את ה-Data Package הבא והפק דו"ח הערכת מלחמה.
+התבסס אך ורק על המידע שנאסף:
 {json.dumps(pkg, ensure_ascii=False)}
 
-הדו"ח חייב לכלול:
-1. הערכת אמינות (Likelihood) בסולם 0-100.
-2. זיהוי סתירות מובנות במידע (Contradiction Matrix).
-3. ניתוח תרחישים עתידיים (1-12 חודשים).
-4. ציון מפורש אם מדובר במידע כוזב (Disinformation) על בסיס הממצאים.
+עליך לבצע תהליך חשיבה של "איפכא מסתברא" (Devil's Advocate) לפני קביעת ההסתברות.
 
-כתוב בעברית אנליטית ומקצועית.
+מבנה הדו"ח (חובה להקפיד על הסדר):
+
+1. **סטטוס סימנים מעידים (Hard Signals Status)**:
+   האם נמצאו הוכחות לוגיסטיות בשטח? (בתי חולים, גיוס מילואים, שיבושי GPS). אם לא נמצאו, ציין זאת בבירור.
+
+2. **ניתוח השערות מתחרות (ACH Analysis)**:
+   - *השערה א' (הסלמה למלחמה):* מה תומך בזה?
+   - *השערה ב' (לוחמה פסיכולוגית/רעש):* מה תומך בזה?
+   - *הכרעה:* איזה צד חזק יותר בראיות?
+
+3. **טבלת סבירות למלחמה (The Probability Matrix)**:
+   צור טבלת Markdown:
+   | טווח זמן | סבירות (%) | נימוק מודיעיני (Evidence Based) | רמת ביטחון בהערכה |
+   |---|---|---|---|
+   | מיידי (עד חודש) | % | ... | ... |
+   | קצר (3 חודשים) | % | ... | ... |
+   | בינוני (6 חודשים) | % | ... | ... |
+   | ארוך (שנה) | % | ... | ... |
+
+   *כלל ברזל לקביעת אחוזים:* אם אין סימנים לוגיסטיים (דלק, בתי חולים, תחמושת) - הסבירות למלחמה מיידית חייבת להיות נמוכה, גם אם הרטוריקה בטוויטר גבוהה.
+
+4. **מסקנה למקבל ההחלטות**: שורה תחתונה ברורה.
+
+כתוב בעברית מודיעינית, קרה ומדויקת.
 """
     try:
         resp = client.models.generate_content(
@@ -142,73 +187,88 @@ def run_pro_strategic_analysis(pkg: Dict[str, Any]) -> str:
         )
         return resp.text
     except Exception as e:
-        return f"Pro Model Error ({PRO_MODEL}): {str(e)}"
+        return f"Pro Model Error: {str(e)}"
 
 # ----------------------------
 # Streamlit Interface
 # ----------------------------
-st.set_page_config(page_title="Gemini 3 OSINT", layout="wide")
+st.set_page_config(page_title="Gemini 3 OSINT War Room", layout="wide", page_icon="📡")
 
-st.title("🛡️ Gemini 3 OSINT Engine")
-st.caption(f"Configured Models: Flash='{FLASH_MODEL}' | Pro='{PRO_MODEL}'")
+st.markdown("""
+<style>
+    .stTextArea textarea { font-size: 16px !important; }
+    .stAlert { direction: rtl; }
+</style>
+""", unsafe_allow_html=True)
+
+st.title("📡 Gemini 3 Advanced OSINT & War Predictor")
+st.caption(f"Engine: {FLASH_MODEL} (Collector) -> {PRO_MODEL} (Analyst) | Method: ACH & Hard Signals")
 
 with st.sidebar:
-    st.header("מקורות בדיקה")
-    st.write(FACT_CHECK_SITES)
+    st.header("מערך איסוף")
+    st.info("המערכת סורקת באופן יזום: \n- Twitter/X \n- Telegram Channels \n- Official Reports \n- Fact Checkers")
     st.divider()
-    if st.button("בדוק מודלים זמינים בחשבון"):
-        try:
-            models = client.models.list_models()
-            st.write([m.name for m in models])
-        except Exception as e:
-            st.error(f"Error listing models: {e}")
+    st.write("**מקורות אימות:**", FACT_CHECK_SITES)
 
 col1, col2 = st.columns([1, 1])
 
 with col1:
-    user_text = st.text_area("הכנס טקסט / ידיעה לבדיקה:", height=250)
-    user_links = st.text_area("קישורים (אופציונלי):", height=100)
+    st.subheader("📝 הזנת מידע")
+    user_text = st.text_area("נושא החקירה (טקסט חופשי / שמועה):", height=200, placeholder="לדוגמה: דיווחים בטלגרם על תנועת כוחות חריגה בגבול הצפון...")
+    user_links = st.text_area("קישורים ספציפיים (אופציונלי):", height=100)
 
 with col2:
-    uploaded = st.file_uploader("העלה תמונות / סקרינשוטים:", type=["png", "jpg", "jpeg"], accept_multiple_files=True)
+    st.subheader("📷 ראיות ויזואליות")
+    uploaded = st.file_uploader("העלה צילומי מסך/מפות:", type=["png", "jpg", "jpeg"], accept_multiple_files=True)
+    if uploaded:
+        st.success(f"{len(uploaded)} קבצים נטענו לניתוח")
 
-if st.button("בצע חקירה רב-שכבתית", type="primary", use_container_width=True):
+if st.button("🚀 הרץ הערכת מודיעין מלאה", type="primary", use_container_width=True):
     if not user_text and not uploaded:
-        st.error("יש להזין קלט כלשהו.")
+        st.error("חובה להזין טקסט או להעלות תמונה.")
     else:
         links = _clean_links(user_links)
         imgs = [f.read() for f in uploaded] if uploaded else []
 
-        with st.status(f"מפעיל את {FLASH_MODEL} ו-{PRO_MODEL}...") as status:
+        # קונטיינר לתהליך
+        with st.status("מבצע נוהל קרב מודיעיני...", expanded=True) as status:
             
-            # שלב 1: Flash
-            st.write(f"🕵️ מפעיל Source Discovery ({FLASH_MODEL})...")
+            # שלב 1
+            st.write("📡 **Flash:** סריקת רשתות, איתור סימנים מעידים (GPS, לוגיסטיקה)...")
             data_package = run_flash_source_discovery(user_text, links, imgs)
             
-            # בדיקת שגיאות קריטית
             if "error" in data_package and not data_package.get("verified_links"):
-                st.error(f"תקלה בשלב ה-Flash: {data_package['error']}")
+                status.update(label="שגיאה באיסוף", state="error")
+                st.error(f"תקלה: {data_package['error']}")
                 st.stop()
+            
+            # הצגת ממצאי ביניים
+            inds = data_package.get("hard_indicators", {})
+            st.markdown(f"""
+            - **ממצאים לוגיסטיים:** {len(inds.get('logistics_status', '')) > 5}
+            - **שיח בטלגרם/טוויטר:** {len(data_package.get('social_media_intel', {}).get('telegram_chatter', []))} פריטים
+            """)
 
-            # שלב 2: Pro
-            st.write(f"📊 מפעיל Strategic Analysis ({PRO_MODEL})...")
+            # שלב 2
+            st.write("🧠 **Pro:** ביצוע ניתוח השערות מתחרות (ACH) וחישוב הסתברות...")
             final_report = run_pro_strategic_analysis(data_package)
             
-            status.update(label="הניתוח הושלם", state="complete")
+            status.update(label="הערכת המצב הושלמה", state="complete")
 
-        # UI: התרעת פייק ניוז
-        is_fake = data_package.get("known_hoax_check", {}).get("is_known_fake", False)
-        if is_fake:
-            st.error(f"🛑 **אזהרה:** המידע זוהה כפייק ניוז: {data_package['known_hoax_check'].get('details')}")
-
-        # UI: הצגת הדו"ח
-        st.markdown("### 📋 דו\"ח ניתוח סופי")
+        # הצגת תוצאות
+        st.divider()
+        
+        # אזהרת פייק
+        if data_package.get("known_hoax_check", {}).get("is_fake"):
+            st.error(f"🚨 **מדובר בחדשות כזב (Fake News):** {data_package['known_hoax_check']['details']}")
+        
+        st.markdown("## 📊 דו\"ח מודיעין מסכם")
         st.markdown(final_report)
 
-        # UI: הרחבות (Expanders)
-        with st.expander("🔗 לינקים שאומתו בחיפוש"):
-            for l in data_package.get("verified_links", []):
-                st.write(f"- {l}")
-
-        with st.expander("⚙️ נתוני גלם (JSON Package)"):
+        # הרחבות
+        with st.expander("🔍 נתונים גולמיים מהשטח (JSON)"):
             st.json(data_package)
+            
+        with st.expander("🔗 מקורות מידע שאומתו"):
+            for link in data_package.get("verified_links", []):
+                st.markdown(f"- [{link}]({link})")
