@@ -9,16 +9,16 @@ from google import genai
 from google.genai import types
 
 # ============================================================
-# 📡 Gemini 3 OSINT Investigation Engine (Evidence-first)
+# 📡 Gemini 3 OSINT Investigation Engine (RAW -> Evidence-first)
 # ============================================================
-# שינוי מרכזי בבקשה שלך:
-# - Flash מחויב לחפש גם ב-X/Twitter וגם ב-Telegram (דרך site:x.com / site:twitter.com / site:t.me),
-#   וגם לחפש "תמונות לוויין" ציבוריות + "הדלפות" ציבוריות (חקירה עיתונאית/דו"חות).
-#
-# חשוב:
-# - אין כאן API רשמי ל-X/Telegram. האכיפה נעשית דרך Google Search עם site:...
-# - "הדלפות" = רק תוכן ציבורי שפורסם ע"י כלי תקשורת/גופים מוכרים. לא חיפוש/שימוש בחומרים גנובים.
-# - אין מודיעין טקטי/אופרטיבי: אין קואורדינטות, אין נתיבים, אין "איך לבצע".
+# מטרות:
+# 1) Flash: אוסף OSINT גולמי עם URL בלבד, כולל חובה לחיפוש:
+#    - X/Twitter (site:x.com + site:twitter.com)
+#    - Telegram (site:t.me)
+#    - Satellite imagery (מקורות ציבוריים)
+#    - Public leak reporting (עיתונאות/דו"חות ציבוריים בלבד)
+# 2) Pro: מנתח רק מתוך items_ranked (ללא המצאות), וכל שורה משמעותית
+#    חייבת להכיל [#] + URL -> enforced by code + prompt.
 # ============================================================
 
 # ----------------------------
@@ -59,7 +59,7 @@ def _clean_links(raw: str) -> List[str]:
         if u and u not in seen:
             seen.add(u)
             out.append(u)
-    return out[:80]
+    return out[:100]
 
 def _safe_json_loads(s: str) -> Dict[str, Any]:
     s = (s or "").strip()
@@ -102,6 +102,13 @@ def _strip_coordinates(text: str) -> str:
         return text
     return _COORD_RE.sub("[coord-redacted]", text)
 
+def _domain(url: str) -> str:
+    try:
+        m = re.search(r"https?://([^/]+)/", url)
+        return (m.group(1).lower() if m else "").strip()
+    except Exception:
+        return ""
+
 def _normalize_platform(url: str, platform: Optional[str]) -> str:
     u = (url or "").lower()
     p = (platform or "").lower().strip()
@@ -112,15 +119,17 @@ def _normalize_platform(url: str, platform: Optional[str]) -> str:
         return "telegram"
     if p in {"official", "gov", "government"}:
         return "official"
-    if p:
-        return p
 
     if "t.me/" in u:
         return "telegram"
     if "twitter.com/" in u or "x.com/" in u:
         return "x"
-    if any(dom in u for dom in ["whitehouse.gov", "defense.gov", "congress.gov", "omb.gov", "gao.gov"]):
+
+    # official heuristics
+    dom = _domain(u)
+    if dom.endswith(".gov") or dom in {"defense.gov", "whitehouse.gov", "omb.gov", "congress.gov"}:
         return "official"
+
     return "web"
 
 def _guess_item_type(url: str, current: Optional[str]) -> str:
@@ -134,6 +143,29 @@ def _guess_item_type(url: str, current: Optional[str]) -> str:
     if any(u.endswith(ext) for ext in [".pdf", ".doc", ".docx"]):
         return "document"
     return "text"
+
+# דומיינים "חשודים" (לא חוסמים לחלוטין, אבל מענישים ניקוד + מסמנים)
+SUSPECT_DOMAIN_HINTS = [
+    "war.gov",  # דוגמה מהתוצאה אצלך - לא סטנדרטי
+]
+
+HIGH_TRUST_DOMAINS = {
+    "defense.gov", "www.defense.gov",
+    "whitehouse.gov", "www.whitehouse.gov",
+    "omb.gov", "www.omb.gov",
+    "congress.gov", "www.congress.gov",
+    "gao.gov", "www.gao.gov",
+    "nasa.gov", "www.nasa.gov",
+    "earthdata.nasa.gov",
+    "usgs.gov", "www.usgs.gov",
+    "copernicus.eu", "www.copernicus.eu",
+    "europa.eu", "commission.europa.eu",
+    "sipri.org", "www.sipri.org",
+    "reuters.com", "www.reuters.com",
+    "apnews.com", "www.apnews.com",
+    "bbc.co.uk", "www.bbc.co.uk", "bbc.com", "www.bbc.com",
+    "ft.com", "www.ft.com",
+}
 
 def _sanitize_item(it: Dict[str, Any]) -> Dict[str, Any]:
     url = (it.get("url") or "").strip()
@@ -155,13 +187,11 @@ def _sanitize_item(it: Dict[str, Any]) -> Dict[str, Any]:
     tags = [str(t).strip() for t in tags if str(t).strip()]
 
     allowed = {
-        # conflict-ish / hard signals (public, non-actionable)
         "notam", "gps_jamming", "hospital", "reserve_callup", "air_defense", "movement", "evac_warning",
-        # claim verification / finance anchors
         "budget_official", "budget_media", "budget_factcheck", "macro_anchor", "claim_origin",
-        "official_statement", "policy_doc", "other",
-        # new: satellite + leaks (public)
+        "official_statement", "policy_doc",
         "satellite_imagery", "leak_report", "whistleblower_claim",
+        "other",
     }
     tags = [t for t in tags if t in allowed]
     if not tags:
@@ -197,9 +227,12 @@ def _sanitize_item(it: Dict[str, Any]) -> Dict[str, Any]:
     if author is not None:
         author = str(author).strip() or None
 
+    dom = _domain(url)
+
     return {
         "platform": platform,
         "url": url,
+        "domain": dom,
         "published_time": published_time,
         "author_or_channel": author,
         "item_type": item_type,
@@ -226,7 +259,7 @@ def _dedupe_items(items: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], Li
         ex = (it.get("raw_excerpt") or "").strip().lower()
         ex_key = re.sub(r"\s+", " ", ex)[:220]
         if ex_key and ex_key in seen_excerpt:
-            notes.append(f"Removed near-duplicate excerpt for URL: {url}")
+            notes.append(f"Removed near-duplicate excerpt: {url}")
             continue
         if ex_key:
             seen_excerpt.add(ex_key)
@@ -242,20 +275,30 @@ def _score_item_rulebased(it: Dict[str, Any]) -> Dict[str, Any]:
     reasons: List[str] = []
 
     plat = it.get("platform")
-    if plat == "official":
-        score += 40; reasons.append("Official baseline +40")
-    elif plat == "web":
-        score += 18; reasons.append("Web baseline +18")
-    elif plat == "x":
-        score += 10; reasons.append("X baseline +10")
-    elif plat == "telegram":
-        score += 8; reasons.append("Telegram baseline +8")
-    else:
-        score += 10; reasons.append("Other baseline +10")
+    dom = it.get("domain") or ""
 
+    # Platform baseline
+    if plat == "official":
+        score += 42; reasons.append("Official +42")
+    elif plat == "web":
+        score += 18; reasons.append("Web +18")
+    elif plat == "x":
+        score += 10; reasons.append("X +10")
+    elif plat == "telegram":
+        score += 8; reasons.append("Telegram +8")
+    else:
+        score += 10; reasons.append("Other +10")
+
+    # Domain trust tweaks
+    if dom in HIGH_TRUST_DOMAINS or dom.endswith(".gov"):
+        score += 12; reasons.append("High-trust domain +12")
+
+    if any(bad in dom for bad in SUSPECT_DOMAIN_HINTS):
+        score -= 25; reasons.append("Suspect domain -25")
+
+    # Tag weights
     tags = set(it.get("tags") or [])
     tag_weights = {
-        # finance/verification
         "budget_official": 22,
         "budget_factcheck": 18,
         "budget_media": 14,
@@ -264,16 +307,14 @@ def _score_item_rulebased(it: Dict[str, Any]) -> Dict[str, Any]:
         "official_statement": 14,
         "claim_origin": 6,
 
-        # conflict-ish (public)
         "notam": 18,
         "hospital": 16,
         "reserve_callup": 16,
         "gps_jamming": 14,
-        "movement": 12,
+        "movement": 12,         # תזוזות צבא — נשאר
         "air_defense": 12,
         "evac_warning": 10,
 
-        # new
         "satellite_imagery": 16,
         "leak_report": 14,
         "whistleblower_claim": 8,
@@ -298,6 +339,7 @@ def _score_item_rulebased(it: Dict[str, Any]) -> Dict[str, Any]:
 
     score = max(0, min(100, score))
     bucket = "High" if score >= 75 else ("Medium" if score >= 50 else "Low")
+
     out = dict(it)
     out["evidence_score"] = score
     out["evidence_bucket"] = bucket
@@ -316,23 +358,16 @@ def _count_tags(items: List[Dict[str, Any]]) -> Dict[str, int]:
             counts[t] = counts.get(t, 0) + 1
     return counts
 
-def _report_has_minimum_citations(report: str, min_urls: int, min_item_refs: int) -> bool:
-    url_count = len(re.findall(r"https?://", report or "", flags=re.IGNORECASE))
-    ref_count = len(re.findall(r"#\d+", report or ""))
-    return url_count >= min_urls and ref_count >= min_item_refs
-
-# ----------------------------
-# Topic classifier (lightweight)
-# ----------------------------
 def classify_topic(user_text: str) -> str:
     t = (user_text or "").lower()
     finance_keywords = [
         "budget", "תקציב", "trillion", "טריליון", "billion", "מיליארד", "gdp", "תמ\"ג",
-        "appropriation", "omb", "congress", "pentagon", "defense budget"
+        "appropriation", "omb", "congress", "pentagon", "defense budget", "dod",
     ]
     conflict_keywords = [
         "war", "מלחמה", "attack", "תקיפה", "missile", "טילים", "iran", "איראן",
-        "notam", "צו 8", "מילואים", "gps", "jamming", "פיקוד העורף", "satellite", "לוויין"
+        "notam", "צו 8", "מילואים", "gps", "jamming", "satellite", "לוויין",
+        "deployment", "movement", "air defense",
     ]
     f = any(k in t for k in finance_keywords)
     w = any(k in t for k in conflict_keywords)
@@ -345,90 +380,73 @@ def classify_topic(user_text: str) -> str:
     return "general_claim"
 
 # ----------------------------
-# Step 1: Flash - Deep RAW Investigator (with forced social/sat/leaks)
+# Flash: RAW collector with forced searches
 # ----------------------------
 def run_flash_deep_investigation(user_claim: str, user_links: List[str], images: List[bytes], topic: str) -> Dict[str, Any]:
     search_tool = types.Tool(google_search=types.GoogleSearch())
     today = datetime.datetime.now().strftime("%Y-%m-%d")
 
-    # Forced cross-domain query packs (social + satellite + leaks)
     forced_social = """
 MANDATORY SOCIAL SEARCH (must run):
 - X/Twitter:
-  * site:x.com "<core keywords>"  (also try Hebrew/Russian variants)
+  * site:x.com "<core keywords>"
   * site:twitter.com "<core keywords>"
 - Telegram:
-  * site:t.me "<core keywords>"  (also try Hebrew/Russian variants)
-- Output requirement:
-  * If any relevant results exist, include at least 2 X items and 2 Telegram items in items[].
+  * site:t.me "<core keywords>"
+REQUIREMENT:
+- If results exist, include at least 2 X items and 2 Telegram items in items[].
 """
 
     forced_satellite = """
 MANDATORY SATELLITE/IMAGERY SEARCH (public only; must run):
-- Try: "satellite imagery" + <core location/entity> + <date/window>
-- Prefer public/credible imagery sources & analyses:
-  * site:earthdata.nasa.gov
-  * site:usgs.gov
-  * site:copernicus.eu
-  * Sentinel / Landsat references
-  * Credible OSINT analysis pages/articles (e.g., Bellingcat) that cite imagery
-- Output requirement:
-  * If any relevant satellite/imagery analysis exists, include at least 1-2 items tagged satellite_imagery.
+- Search: "satellite imagery" + <core entity/location> + <date/window>
+- Prefer public/credible sources & analyses:
+  * NASA Earthdata / USGS / Copernicus (Sentinel/Landsat) + reputable OSINT analysis (e.g., Bellingcat)
+REQUIREMENT:
+- If any relevant public satellite/imagery analysis exists, include 1-2 items tagged satellite_imagery.
 """
 
     forced_leaks = """
 MANDATORY "LEAKS" SEARCH (public reporting only; must run):
-- Look for PUBLIC investigative reporting referencing leaked documents/whistleblowers:
-  * "leaked" OR "whistleblower" + <core keywords>
-  * site:bellingcat.com
-  * site:icij.org
-  * site:occrp.org
-  * major outlets (Reuters/AP/FT/WSJ/BBC etc.)
-- DO NOT seek stolen/illegal material repositories.
-- Output requirement:
-  * If any reputable public leak-reporting exists, include 1 item tagged leak_report or whistleblower_claim.
+- Search: ("leaked" OR "whistleblower") + <core keywords>
+- Prefer: Bellingcat / ICIJ / OCCRP / major outlets (Reuters/AP/BBC/FT/WSJ)
+- DO NOT seek illegal repositories.
+REQUIREMENT:
+- If reputable public leak-reporting exists, include 1 item tagged leak_report or whistleblower_claim.
 """
 
     finance_pack = """
-INVESTIGATION PACK (Finance / Budget Claims):
-- Official anchors (must try):
-  1) site:defense.gov budget request FY
-  2) site:whitehouse.gov budget defense FY
-  3) site:omb.gov budget defense
-  4) site:congress.gov defense appropriation FY
-- Credible media anchors:
-  5) Reuters US defense budget
-  6) AP Pentagon budget request
-- Fact-check:
-  7) site:snopes.com <claim keywords>
-  8) FullFact / CheckYourFact / FakeReporter <claim keywords>
-- Macro anchors:
-  9) US GDP latest estimate
-  10) SIPRI global military spending total latest
+INVESTIGATION PACK (Finance / Budget Claims) - MUST TRY:
+OFFICIAL:
+1) site:defense.gov (budget request OR FY2026 OR fiscal year 2026) defense
+2) site:whitehouse.gov budget defense FY
+3) site:omb.gov budget defense
+4) site:congress.gov (national defense authorization OR appropriations) FY2026
+MEDIA:
+5) Reuters US defense budget FY2026
+6) AP Pentagon budget request FY2026
+FACT CHECK:
+7) site:snopes.com 4.3 trillion defense budget
+8) FullFact OR CheckYourFact OR FakeReporter keywords
+MACRO ANCHORS:
+9) SIPRI global military spending total
+10) US GDP defense spending percentage
 """
 
     conflict_pack = """
-INVESTIGATION PACK (Conflict / Security Claims):
-- Official/public anchors (must try):
-  1) Official statements (gov/mil) relevant to claim
-  2) NOTAM / aviation authority notices (public)
-  3) Public health/hospital notices (public only)
-- Credible media anchors:
-  4) Reuters / AP / BBC / major outlets on the specific claim
-- Fact-check:
-  5) FakeReporter/Irrelevant/Snopes/FullFact keywords
-- Hard indicators (public only; non-actionable):
-  6) GPS jamming reports (public articles)
-  7) Reserve call-up reports (public)
-  8) Hospital readiness (public)
-  9) Publicly reported movement/deployment (NO coordinates/routes)
+INVESTIGATION PACK (Conflict / Security Claims) - public only:
+1) Official statements (gov/mil)
+2) NOTAM / aviation authority notices
+3) Public hospital readiness notices
+4) Reuters / AP / BBC on the specific claim
+5) Fact-check sources
+6) GPS jamming reports (public)
+7) Publicly reported deployments/movements (NO routes/coords)
 """
 
     general_pack = """
 INVESTIGATION PACK (General Claim Verification):
-- Try official statements, credible media, and fact-check sources.
-- Try origin tracing on Telegram and X.
-- Collect at least 12 items if possible.
+- Official statements, credible media, fact-check, origin tracing on X/Telegram.
 """
 
     pack = general_pack
@@ -440,20 +458,17 @@ INVESTIGATION PACK (General Claim Verification):
         pack = finance_pack + "\n" + conflict_pack
 
     prompt = f"""
-You are an OSINT INVESTIGATOR (RAW COLLECTOR, not an analyst).
+You are an OSINT RAW COLLECTOR.
 Date: {today}.
-Mission: Investigate the user's claim deeply by collecting evidence items with URLs,
-cross-checking official anchors, credible media, fact-checkers, and tracing the claim's origin.
+Mission: Investigate the user's claim deeply by collecting RAW evidence items with direct URLs only.
 
 ABSOLUTE RULES:
 - Output ONLY JSON. No prose.
 - Every item MUST have a direct URL.
-- raw_excerpt must be copied from the source (tight excerpt), no paraphrase.
-- Do NOT invent numbers, names, or context.
-- Do NOT provide actionable tactical intelligence:
-  no coordinates, no routes, no targets. If a source has coordinates, redact them.
-- Collect BOTH supporting and refuting evidence.
-- You MUST run the mandatory search blocks below.
+- raw_excerpt must be verbatim excerpt (short), no paraphrase.
+- Do NOT invent any fact.
+- No tactical intelligence: no coordinates, routes, targets. If coordinates appear, redact.
+- Collect both supporting and refuting items.
 
 {forced_social}
 {forced_satellite}
@@ -464,7 +479,7 @@ ABSOLUTE RULES:
 USER CLAIM:
 {user_claim}
 
-USER-PROVIDED LINKS (if any):
+USER PROVIDED LINKS:
 {user_links}
 
 OUTPUT SCHEMA (STRICT JSON):
@@ -477,11 +492,9 @@ OUTPUT SCHEMA (STRICT JSON):
     "key_numbers": ["..."],
     "key_dates_or_timeframe": ["..."],
     "core_assertions": ["..."],
-    "core_keywords_for_search": ["..."]   // must include 6-12 keywords/phrases to reuse in social searches
+    "core_keywords_for_search": ["..."]
   }},
-  "query_log": [
-    "<list the key queries you actually ran (at least 10)>"
-  ],
+  "query_log": ["<at least 10 queries you ran>"],
   "items": [
     {{
       "platform": "x|telegram|web|official",
@@ -489,7 +502,7 @@ OUTPUT SCHEMA (STRICT JSON):
       "published_time": "<ISO-8601 if known else null>",
       "author_or_channel": "<handle/channel/site if known else null>",
       "item_type": "text|image|video|document|map",
-      "raw_excerpt": "<max 280 chars verbatim excerpt (redact coordinates)>",
+      "raw_excerpt": "<verbatim excerpt max 280 chars (redact coordinates)>",
       "media_urls": ["<url>", "..."],
       "tags": [
         "budget_official|budget_media|budget_factcheck|macro_anchor|claim_origin|official_statement|policy_doc|notam|gps_jamming|hospital|reserve_callup|air_defense|movement|evac_warning|satellite_imagery|leak_report|whistleblower_claim|other"
@@ -510,17 +523,17 @@ OUTPUT SCHEMA (STRICT JSON):
     }},
     "spread_patterns": ["<short notes>"]
   }},
-  "coverage_gaps": ["<what could not be found>"],
-  "dedupe_notes": []
+  "coverage_gaps": ["<what could not be found>"]
 }}
 
-COLLECTION TARGETS:
+COLLECTION TARGET:
 - Aim for 15-25 items if possible.
-- If results exist, try to include:
-  * ≥2 X items, ≥2 Telegram items
-  * ≥1-2 satellite_imagery items
-  * ≥1 leak_report/whistleblower_claim item (only if from reputable public reporting)
-  * ≥2 official anchors, ≥2 credible media, ≥1 fact-check (if exists)
+- Try to include:
+  * ≥2 X, ≥2 Telegram (if exist)
+  * ≥2 official anchors (if topic finance -> MUST be .gov anchors if exist)
+  * ≥1 fact-check (if exists)
+  * ≥1 satellite_imagery (if exists)
+  * ≥1 leak_report/whistleblower_claim (only if reputable public reporting exists)
 """
 
     parts = [types.Part(text=prompt)]
@@ -540,13 +553,13 @@ COLLECTION TARGETS:
             config=config,
         )
         pkg = _safe_json_loads(resp.text)
-        pkg["verified_links"] = _extract_grounding_urls(resp)  # debug-only
+        pkg["verified_links"] = _extract_grounding_urls(resp)  # debug
         return pkg
     except Exception as e:
         return {"error": f"Flash Model Error: {str(e)}", "items": [], "verified_links": []}
 
 # ----------------------------
-# Step 1.5: Enrich + Rank (Deterministic)
+# Enrich / Rank / Make Evidence Blocks
 # ----------------------------
 def enrich_and_rank_package(pkg: Dict[str, Any]) -> Dict[str, Any]:
     out = dict(pkg)
@@ -560,11 +573,11 @@ def enrich_and_rank_package(pkg: Dict[str, Any]) -> Dict[str, Any]:
             sanitized.append(_sanitize_item(it))
 
     deduped, notes = _dedupe_items(sanitized)
-    out["items"] = deduped[:180]
-    out["dedupe_notes"] = list(dict.fromkeys((out.get("dedupe_notes") or []) + notes))[:60]
+    out["items"] = deduped[:220]
+    out["dedupe_notes"] = notes[:80]
 
     ranked = _rank_items(out["items"])
-    out["items_ranked"] = ranked[:90]
+    out["items_ranked"] = ranked[:120]
     out["tag_counts"] = _count_tags(out["items_ranked"])
 
     out["anchor_counts"] = {
@@ -573,256 +586,15 @@ def enrich_and_rank_package(pkg: Dict[str, Any]) -> Dict[str, Any]:
         "telegram": sum(1 for it in out["items_ranked"] if it.get("platform") == "telegram"),
         "satellite": sum(1 for it in out["items_ranked"] if "satellite_imagery" in (it.get("tags") or [])),
         "leaks": sum(1 for it in out["items_ranked"] if ("leak_report" in (it.get("tags") or []) or "whistleblower_claim" in (it.get("tags") or []))),
+        "suspect_domains": sum(1 for it in out["items_ranked"] if any(bad in (it.get("domain") or "") for bad in SUSPECT_DOMAIN_HINTS)),
     }
     return out
 
-# ----------------------------
-# Step 2: Pro - Evidence-first Analysis
-# ----------------------------
-def run_pro_analysis(enriched_pkg: Dict[str, Any], mode: str) -> str:
-    today = datetime.datetime.now().strftime("%Y-%m-%d")
-
-    system_instruction = (
-        "You are a Senior Analyst. Evidence-first. "
-        "You MUST NOT invent facts. You MUST cite [#] + URL for every non-trivial claim."
-    )
-
-    pro_input = {
-        "subject": enriched_pkg.get("subject"),
-        "topic": enriched_pkg.get("topic"),
-        "collection_timestamp_utc": enriched_pkg.get("collection_timestamp_utc"),
-        "claim_decomposition": enriched_pkg.get("claim_decomposition", {}),
-        "query_log": enriched_pkg.get("query_log", []),
-        "tag_counts": enriched_pkg.get("tag_counts", {}),
-        "anchor_counts": enriched_pkg.get("anchor_counts", {}),
-        "origin_trace": enriched_pkg.get("origin_trace", {}),
-        "coverage_gaps": enriched_pkg.get("coverage_gaps", []),
-        "items_ranked": (enriched_pkg.get("items_ranked", []) or [])[:50],
-    }
-
-    if mode == "PARTIAL":
-        mode_rules = """
-MODE=PARTIAL:
-- Do NOT output numeric probabilities.
-- Keep cautious: supported / refuted / unknown.
-- Verdict must be one of: "נכון חלקית", "לא מאומת", "מטעה", "ככל הנראה כוזב".
-"""
-        min_urls, min_refs = 6, 5
-    else:
-        mode_rules = """
-MODE=FULL:
-- You may provide verdict + confidence (Low/Medium/High) but not invented numbers.
-- Prefer anchoring to official/fact-check/media first, then social, then satellite/leaks.
-"""
-        min_urls, min_refs = 9, 7
-
-    user_prompt = f"""
-Date: {today}
-
-HARD RULES:
-1) Every claim must cite [#] + URL (same line).
-2) No URL => write "לא ידוע / אין ראיה".
-3) Do NOT invent names, numbers, dates, operations, exercises, or events.
-4) If evidence is conflicting, show both sides with citations.
-5) Social posts (X/Telegram) are not authoritative. Treat as "claims" unless corroborated.
-6) Satellite/leaks items must be treated cautiously; only if from credible public reporting/analysis.
-
-{mode_rules}
-
-DATA PACKAGE (JSON):
-{json.dumps(pro_input, ensure_ascii=False)}
-
-OUTPUT FORMAT (Hebrew, precise):
-
-1) Evidence Table (Top 12):
-| # | פלטפורמה | תגיות | Score | מקור (URL) | Excerpt |
-
-2) Cross-source Triangulation:
-- Official anchors: what they say.
-- Credible media: what they say.
-- Fact-check: what they say.
-- Social (X/Telegram): what is being claimed, and whether corroborated.
-- Satellite/leaks (if present): what they add (with strict caution).
-Each bullet must cite [#] + URL.
-
-3) Origin Trace:
-- Earliest found / likely origin with [#] + URL, else "לא ידוע".
-
-4) Verdict + Confidence:
-- Verdict: one of ["נכון", "נכון חלקית", "מטעה", "ככל הנראה כוזב", "לא מאומת"]
-- Confidence: Low/Medium/High
-- 2-4 lines with citations.
-
-5) Missing Evidence:
-- Practical list: what links/docs would close gaps.
-"""
-
-    try:
-        resp = client.models.generate_content(
-            model=PRO_MODEL,
-            contents=[types.Content(role="user", parts=[types.Part(text=user_prompt)])],
-            config=types.GenerateContentConfig(
-                system_instruction=system_instruction,
-                temperature=0.2,
-            ),
-        )
-        report = resp.text or ""
-        if not _report_has_minimum_citations(report, min_urls=min_urls, min_item_refs=min_refs):
-            return (
-                "❌ הדו\"ח נחסם: אין מספיק ציטוטים [#] + URL.\n\n"
-                "זה מונע המצאות. בדוק items_ranked/coverage_gaps ונסה שוב."
-            )
-        return report
-    except Exception as e:
-        return f"Pro Model Error: {str(e)}"
-
-# ----------------------------
-# Decide mode (based on evidence + required sources)
-# ----------------------------
-def decide_mode(enriched_pkg: Dict[str, Any]) -> str:
-    ranked = enriched_pkg.get("items_ranked", []) or []
-    anchors = enriched_pkg.get("anchor_counts", {}) or {}
-
-    # FULL requires enough evidence + at least some social coverage if exists
-    if len(ranked) >= 16 and anchors.get("official", 0) >= 2 and anchors.get("x", 0) >= 1 and anchors.get("telegram", 0) >= 1:
-        return "FULL"
-    if len(ranked) >= 7:
-        return "PARTIAL"
-    return "NO_EVIDENCE"
-
-# ----------------------------
-# Streamlit UI
-# ----------------------------
-st.set_page_config(page_title="Gemini 3 OSINT Investigation Engine", layout="wide", page_icon="📡")
-
-st.markdown(
+def build_evidence_blocks(items_ranked: List[Dict[str, Any]], limit: int = 20) -> str:
     """
-<style>
-  .stTextArea textarea { font-size: 16px !important; }
-  .small { font-size: 13px; opacity: 0.85; }
-</style>
-""",
-    unsafe_allow_html=True,
-)
-
-st.title("📡 Gemini 3 OSINT Investigation Engine")
-st.caption(f"Engine: {FLASH_MODEL} (RAW Investigator) → {PRO_MODEL} (Evidence-first Analyst)")
-
-with st.sidebar:
-    st.header("מערך איסוף")
-    st.info(
-        "המערכת מחויבת לחפש גם ב-X/Twitter וגם ב-Telegram (דרך Google site:), "
-        "ולנסות לאתר גם אנליזות/מקורות על תמונות לוויין ציבוריות + דיווחי הדלפות ציבוריים (חקירה עיתונאית)."
-    )
-    st.divider()
-    st.write("**מקורות אימות:**")
-    st.write(FACT_CHECK_SITES)
-    st.divider()
-    st.write("כלל ברזל: בלי URL תומך — אין טענה.")
-
-col1, col2 = st.columns([1, 1])
-
-with col1:
-    st.subheader("📝 טענה / שמועה לבדיקה")
-    user_text = st.text_area(
-        "הדבק טענה אחת (קישורים אופציונלי):",
-        height=240,
-        placeholder="לדוגמה: 'ארה\"ב העלתה תקציב ביטחון ל-4.3 טריליון' או 'יש הכנות חריגות בזירה X'...",
-    )
-    user_links_raw = st.text_area("קישורים ספציפיים (אופציונלי):", height=120)
-
-with col2:
-    st.subheader("📷 ראיות (אופציונלי)")
-    uploaded = st.file_uploader(
-        "העלה סקרינשוטים/תמונות (אופציונלי):",
-        type=["png", "jpg", "jpeg"],
-        accept_multiple_files=True,
-    )
-    if uploaded:
-        st.success(f"{len(uploaded)} קבצים נטענו")
-
-run_btn = st.button("🚀 חקור ונתח", type="primary", use_container_width=True)
-
-if run_btn:
-    if not user_text and not user_links_raw.strip() and not uploaded:
-        st.error("חובה להזין טענה או קישור או להעלות תמונה.")
-        st.stop()
-
-    links = _clean_links(user_links_raw)
-    imgs = [f.read() for f in uploaded] if uploaded else []
-
-    topic = classify_topic(user_text)
-
-    with st.status("מבצע חקירה OSINT (RAW) + הצלבות...", expanded=True) as status:
-        st.write(f"📡 **Flash:** חיפוש חובה ב-X/Telegram + לוויין + הדלפות ציבוריות (topic={topic})…")
-        raw_pkg = run_flash_deep_investigation(user_text, links, imgs, topic)
-
-        if raw_pkg.get("error"):
-            status.update(label="שגיאה באיסוף", state="error")
-            st.error(raw_pkg["error"])
-            st.stop()
-
-        enriched = enrich_and_rank_package(raw_pkg)
-        mode = decide_mode(enriched)
-
-        ranked = enriched.get("items_ranked", []) or []
-        tag_counts = enriched.get("tag_counts", {}) or {}
-        anchor_counts = enriched.get("anchor_counts", {}) or {}
-
-        st.markdown(
-            f"""
-<div class="small">
-<b>Mode:</b> {mode} |
-<b>items_ranked:</b> {len(ranked)} |
-<b>anchors:</b> {anchor_counts} |
-<b>tag_counts:</b> {tag_counts if tag_counts else "None"}
-</div>
-""",
-            unsafe_allow_html=True,
-        )
-
-        if mode == "NO_EVIDENCE":
-            status.update(label="אין מספיק ראיות עם URL", state="error")
-            st.error(
-                "אין מספיק פריטי ראיות עם URL כדי להפיק ניתוח אמין.\n\n"
-                "מה לעשות:\n"
-                "- לחדד ניסוח (שנה/מספר/שם גוף/שם מסמך)\n"
-                "- או להוסיף 1–3 קישורים\n"
-                "- או להעלות סקרינשוט"
-            )
-            with st.expander("⭐ items_ranked (מה כן נאסף)"):
-                st.json(ranked[:30])
-            with st.expander("🕳️ coverage_gaps"):
-                st.write(enriched.get("coverage_gaps", []))
-            st.stop()
-
-        st.write("🧠 **Pro:** ניתוח Evidence-first עם ציטוטים [#] + URL לכל טענה…")
-        report = run_pro_analysis(enriched, mode=mode)
-
-        status.update(label="החקירה הושלמה", state="complete")
-
-    st.divider()
-    st.markdown("## 📊 דו\"ח אימות טענה (Evidence-first)")
-    st.markdown(report)
-
-    with st.expander("⭐ items_ranked (Top 50)"):
-        st.json(ranked[:50])
-
-    with st.expander("🔍 RAW items (Top 120)"):
-        st.json((enriched.get("items") or [])[:120])
-
-    with st.expander("🧩 claim_decomposition"):
-        st.json(enriched.get("claim_decomposition", {}))
-
-    with st.expander("🧪 query_log"):
-        st.json(enriched.get("query_log", []))
-
-    with st.expander("🧭 origin_trace"):
-        st.json(enriched.get("origin_trace", {}))
-
-    with st.expander("🕳️ coverage_gaps"):
-        st.json(enriched.get("coverage_gaps", []))
-
-    with st.expander("🧪 verified_links (debug only)"):
-        st.json(enriched.get("verified_links", []))
-```0
+    בונה "בלוקים" שה-Pro חייב להשתמש בהם. כל בלוק כולל [#] + URL + excerpt.
+    זה מקטין סיכוי להמצאות ומכריח ציטוטים.
+    """
+    blocks = []
+    for idx, it in enumerate(items_ranked[:limit], start=1):
+       
