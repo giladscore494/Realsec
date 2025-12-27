@@ -610,4 +610,639 @@ JSON SCHEMA:
             err = None
             if (grounded_keys or grounded_domains) and not raw_items:
                 err = "EMPTY_ITEMS_WITH_GROUNDING"
-            if not grounded_keys 
+            if not grounded_keys and not grounded_domains:
+                err = "NO_GROUNDING_SOURCES"
+
+            out = {
+                "error": err,
+                "debug": {
+                    "date": date_str,
+                    "raw_items": int(len(raw_items)),
+                    "validated": int(len(validated_items)),
+                    "grounded_urls": int(len(grounded_keys)),
+                    "grounded_domains": int(len(grounded_domains)),
+                    "mode": mode,
+                    **dbg2,
+                },
+                "items": validated_items
+            }
+
+            db_manager.save_data(date_str, query_hash, out)
+            return out, False
+
+        except Exception as e:
+            logger.exception(f"Fetch failed for {date_str}: {e}")
+            out = {"error": str(e), "debug": {"date": date_str, "mode": mode}, "items": []}
+            db_manager.save_data(date_str, query_hash, out)
+            return out, False
+        finally:
+            self.clients.release(client)
+
+
+# =========================
+# Data Analyzer
+# =========================
+class DataAnalyzer:
+    @staticmethod
+    def _clean_text(s: str) -> str:
+        s = (s or "").lower().strip()
+        s = re.sub(r"\s+", " ", s)
+        s = re.sub(r"[^\w\s\-:/\.]", "", s)
+        return s.strip()
+
+    def _fingerprint(self, title: str, snippet: str) -> str:
+        raw = (self._clean_text(title) + "||" + self._clean_text(snippet)).encode("utf-8", errors="ignore")
+        return hashlib.sha1(raw).hexdigest()
+
+    def analyze(self, items: List[Dict[str, Any]]) -> Dict[str, Any]:
+        if not items:
+            return self._empty()
+
+        df = pd.DataFrame(items)
+
+        for col in ["title", "snippet", "url", "source"]:
+            if col not in df.columns:
+                df[col] = ""
+            df[col] = df[col].fillna("").astype(str)
+
+        df["url_norm"] = df["url"].apply(normalize_url)
+        df["domain"] = df["url_norm"].apply(get_domain)
+
+        # hard filters
+        df = df[~df["domain"].isin(Config.BLACKLIST_DOMAINS)]
+        df = df[~df["domain"].apply(is_aggregator_domain)]
+
+        if df.empty:
+            return self._empty()
+
+        # dedup: fingerprint + url_norm
+        df["fp"] = df.apply(lambda r: self._fingerprint(r["title"], r["snippet"]), axis=1)
+        df = df.drop_duplicates("fp")
+        df = df.drop_duplicates("url_norm")
+
+        if df.empty:
+            return self._empty()
+
+        # weights
+        df["weight"] = df["domain"].apply(domain_weight).astype(float)
+
+        df["text"] = (df["title"] + " " + df["snippet"]).str.strip()
+
+        clusters = []
+        if len(df) > 1 and df["text"].str.len().sum() > 0:
+            vec = TfidfVectorizer(analyzer="char_wb", ngram_range=(3, 5), min_df=1)
+            tfidf = vec.fit_transform(df["text"])
+            sim = cosine_similarity(tfidf)
+
+            visited = set()
+            for i in range(len(df)):
+                if i in visited:
+                    continue
+                idxs = [i]
+                visited.add(i)
+                for j in range(i + 1, len(df)):
+                    if j in visited:
+                        continue
+                    if float(sim[i][j]) > Config.CLUSTER_SIM_THRESHOLD:
+                        idxs.append(j)
+                        visited.add(j)
+
+                part = df.iloc[idxs]
+                clusters.append({
+                    "cluster_id": int(len(clusters)),
+                    "main_title": str(part.iloc[0]["title"]),
+                    "count": int(len(part)),
+                    "unique_domains": int(part["domain"].nunique()),
+                    "max_weight": float(part["weight"].max()),
+                    "indices": [int(x) for x in idxs]
+                })
+        else:
+            clusters = [{
+                "cluster_id": 0,
+                "main_title": str(df.iloc[0]["title"]),
+                "count": 1,
+                "unique_domains": 1,
+                "max_weight": float(df.iloc[0]["weight"]),
+                "indices": [0]
+            }]
+
+        unique_domains = set([d for d in df["domain"].unique().tolist() if d])
+        unique_stories = int(len(clusters))
+
+        weighted_volume = float(df["weight"].sum())
+        avg_cluster_quality = float(np.mean([c["max_weight"] for c in clusters])) if clusters else 0.0
+
+        score = (unique_stories * 3.0) + (weighted_volume * 5.0) + (avg_cluster_quality * 20.0)
+        score = float(min(score, 100.0))
+
+        # confidence: calibrated
+        conf = avg_cluster_quality
+        domain_count = len(unique_domains)
+        scarcity_penalty = 1.0
+        if domain_count < 4:
+            scarcity_penalty *= (domain_count / 4.0)
+        if unique_stories < 2:
+            scarcity_penalty *= 0.6
+        conf = float(max(0.0, min(1.0, conf * scarcity_penalty)))
+
+        # evidence: pick best from top clusters
+        evidence = []
+        top_clusters = sorted(clusters, key=lambda x: (x["max_weight"], x["count"]), reverse=True)[:5]
+        seen = set()
+        for cl in top_clusters:
+            cdf = df.iloc[cl["indices"]]
+            best = cdf.sort_values("weight", ascending=False).iloc[0]
+            u = str(best["url_norm"])
+            if u in seen:
+                continue
+            seen.add(u)
+            evidence.append({
+                "title": str(best["title"]),
+                "url": u,
+                "domain": str(best["domain"]),
+                "weight": float(best["weight"]),
+                "is_tier1": bool(float(best["weight"]) >= 0.80),
+            })
+
+        return {
+            "volume": int(len(df)),
+            "clusters": unique_stories,
+            "valid_unique_domains": int(len(unique_domains)),
+            "escalation_score": score,
+            "confidence": round(conf, 2),
+            "top_clusters": top_clusters[:3],
+            "evidence": evidence,
+        }
+
+    @staticmethod
+    def _empty() -> Dict[str, Any]:
+        return {
+            "volume": 0,
+            "clusters": 0,
+            "valid_unique_domains": 0,
+            "escalation_score": 0.0,
+            "confidence": 0.0,
+            "top_clusters": [],
+            "evidence": []
+        }
+
+
+@st.cache_resource
+def get_analyzer() -> DataAnalyzer:
+    return DataAnalyzer()
+
+
+analyzer = get_analyzer()
+
+
+# =========================
+# Timeline metrics (trend/anomaly/correlation)
+# =========================
+def pearson_corr(a: List[float], b: List[float]) -> float:
+    if not a or not b:
+        return 0.0
+    n = min(len(a), len(b))
+    x = np.array(a[:n], dtype=float)
+    y = np.array(b[:n], dtype=float)
+    if float(np.std(x)) == 0.0 or float(np.std(y)) == 0.0:
+        return 0.0
+    return float(np.corrcoef(x, y)[0, 1])
+
+
+def moving_average(arr: List[float], w: int) -> List[float]:
+    if not arr:
+        return []
+    out = []
+    for i in range(len(arr)):
+        start = max(0, i - w + 1)
+        chunk = arr[start:i + 1]
+        out.append(float(np.mean(chunk)))
+    return out
+
+
+def z_scores(arr: List[float]) -> List[float]:
+    if not arr:
+        return []
+    x = np.array(arr, dtype=float)
+    mu = float(np.mean(x))
+    sd = float(np.std(x))
+    if sd == 0.0:
+        return [0.0 for _ in arr]
+    return [float((v - mu) / sd) for v in x]
+
+
+def build_assessment(live_rows: List[Dict[str, Any]], kpis: Dict[str, Any]) -> str:
+    # deterministic, no forecasting
+    max_score = float(kpis.get("live_max_score", 0.0) or 0.0)
+    avg_conf = float(kpis.get("avg_confidence_live", 0.0) or 0.0)
+    anom = int(kpis.get("live_anomaly_count", 0) or 0)
+
+    if not live_rows:
+        return "אין נתונים להצגה בטווח שנבחר (OSINT בלבד)."
+
+    if max_score == 0.0 and avg_conf == 0.0:
+        return (
+            "לא אותר סיגנל תקשורתי מאומת בטווח הנבדק. "
+            "אם זה לא הגיוני מול המציאות, בדוק: מילות מפתח, מצב אימות (Strict/Relaxed), ומקורות."
+        )
+
+    lines = []
+    lines.append(f"בטווח הנבדק: שיא Score={max_score:.2f}, ממוצע Confidence={avg_conf:.2f}, אנומליות={anom}.")
+    if max_score >= 60:
+        lines.append("נפח/איכות דיווחים גלויים גבוהה יחסית (עדיין OSINT).")
+    elif max_score >= 30:
+        lines.append("יש פעילות תקשורתית בינונית-מובהקת (OSINT).")
+    else:
+        lines.append("יש פעילות תקשורתית חלשה/מפוזרת (OSINT).")
+
+    if anom > 0:
+        lines.append("זוהתה חריגה סטטיסטית לפחות פעם אחת (z-score). זה מצדיק בדיקה ידנית של הראיות.")
+    return "\n".join(lines)
+
+
+# =========================
+# Secrets / Access
+# =========================
+GOOGLE_API_KEY = st.secrets.get("GOOGLE_API_KEY", "")
+if not GOOGLE_API_KEY:
+    st.error("חסר GOOGLE_API_KEY ב־Streamlit Secrets. (Settings → Secrets)")
+    st.stop()
+
+APP_PASSWORD = st.secrets.get("APP_PASSWORD", "")
+if APP_PASSWORD:
+    pw = st.sidebar.text_input("סיסמה", type="password")
+    if not pw or not hmac.compare_digest(pw, APP_PASSWORD):
+        st.sidebar.info("נדרש אימות כדי להמשיך.")
+        st.stop()
+
+
+# =========================
+# Sidebar
+# =========================
+with st.sidebar:
+    st.header("⚙️ הגדרות סנסור")
+
+    st.divider()
+    st.subheader("📡 טווחי זמן")
+    reference_anchor = st.date_input("תאריך אירוע עבר (Reference):", datetime.date(2025, 6, 15))
+    live_anchor = st.date_input("תאריך נוכחי (Live):", datetime.date(2025, 12, 28))
+    window_days = st.slider("חלון סריקה (ימים):", 7, 45, 20)
+
+    est_calls = (window_days + 1) * 2
+    st.caption(f"📊 צפי קריאות API: {est_calls} (במקביליות: {Config.MAX_WORKERS})")
+    if est_calls > 60:
+        st.markdown("<span class='metric-warning'>⚠️ שים לב ל-Quota</span>", unsafe_allow_html=True)
+
+    st.divider()
+    validation_mode = st.radio("רמת אימות:", ["Strict", "Relaxed"], index=1)
+    keywords = st.text_input("מילות חיפוש:", "Iran Israel military conflict missile attack nuclear")
+
+    st.divider()
+    show_debug = st.checkbox("הצג Debug לכל יום", value=False)
+
+
+# =========================
+# Execution
+# =========================
+rate_limiter = GlobalRateLimiter(min_interval=Config.MIN_INTERVAL_SEC, jitter=Config.JITTER_SEC)
+
+
+def process_day(scanner: GeminiScanner, d: datetime.date, keywords: str, mode: str) -> Dict[str, Any]:
+    raw_data, cached = scanner.fetch_day(d, keywords, mode)
+    analytics = analyzer.analyze(raw_data.get("items", []))
+    return {
+        "date_obj": d,
+        "date_label": d.strftime("%d/%m"),
+        "raw": raw_data,
+        "analytics": analytics,
+        "cached": cached,
+    }
+
+
+def run_scan() -> Dict[str, Any]:
+    scanner = GeminiScanner(
+        api_key=GOOGLE_API_KEY,
+        rate_limiter=rate_limiter,
+        pool_size=max(2, Config.MAX_WORKERS),
+    )
+
+    ref_dates = [reference_anchor - datetime.timedelta(days=i) for i in range(window_days, -1, -1)]
+    live_dates = [live_anchor - datetime.timedelta(days=i) for i in range(window_days, -1, -1)]
+
+    total_tasks = len(ref_dates) + len(live_dates)
+    completed = 0
+
+    status = st.empty()
+    prog = st.progress(0.0)
+
+    results_map: Dict[str, Dict[str, Any]] = {}
+
+    all_dates = [("Reference", d) for d in ref_dates] + [("Live", d) for d in live_dates]
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=Config.MAX_WORKERS) as ex:
+        futures = {}
+        for typ, d in all_dates:
+            futures[ex.submit(process_day, scanner, d, keywords, validation_mode)] = (typ, d)
+
+        for fut in concurrent.futures.as_completed(futures):
+            typ, d = futures[fut]
+            try:
+                res = fut.result()
+                if typ == "Reference":
+                    delta = (reference_anchor - d).days
+                    res["day_offset"] = int(-delta)
+                else:
+                    delta = (live_anchor - d).days
+                    res["day_offset"] = int(-delta)
+                res["type"] = typ
+                results_map[f"{typ}_{d.isoformat()}"] = res
+            except Exception as e:
+                logger.exception(f"{typ} {d} failed: {e}")
+            finally:
+                completed += 1
+                prog.progress(min(1.0, completed / max(1, total_tasks)))
+                status.text(f"Processed: {d.strftime('%d/%m')} ({typ})")
+
+    ref_timeline = sorted([v for v in results_map.values() if v["type"] == "Reference"], key=lambda x: x["day_offset"])
+    live_timeline = sorted([v for v in results_map.values() if v["type"] == "Live"], key=lambda x: x["day_offset"])
+
+    # KPI
+    ref_scores = [float(x["analytics"]["escalation_score"]) for x in ref_timeline]
+    live_scores = [float(x["analytics"]["escalation_score"]) for x in live_timeline]
+    corr = pearson_corr(ref_scores, live_scores)
+
+    live_conf = [float(x["analytics"]["confidence"]) for x in live_timeline]
+    avg_conf = float(np.mean(live_conf)) if live_conf else 0.0
+    live_max = float(np.max(live_scores)) if live_scores else 0.0
+
+    live_z = z_scores(live_scores)
+    anomalies = [i for i, z in enumerate(live_z) if abs(float(z)) >= Config.ANOMALY_Z_ABS]
+    anom_count = int(len(anomalies))
+
+    kpis = {
+        "correlation": float(corr),
+        "avg_confidence_live": float(avg_conf),
+        "live_max_score": float(live_max),
+        "live_anomaly_count": anom_count,
+    }
+
+    export_obj = {
+        "meta": {
+            "generated_at": datetime.datetime.now().isoformat(),
+            "keywords": keywords,
+            "validation_mode": validation_mode,
+            "window_days": int(window_days),
+            "reference_anchor": reference_anchor.isoformat(),
+            "live_anchor": live_anchor.isoformat(),
+            "models": {"flash": Config.FLASH_MODEL, "pro": Config.PRO_MODEL},
+            "kpis": kpis,
+        },
+        "reference": [
+            {
+                "type": "Reference",
+                "day_offset": x["day_offset"],
+                "date": x["date_label"],
+                "cached": x["cached"],
+                "raw": x["raw"],
+                "analytics": x["analytics"],
+            } for x in ref_timeline
+        ],
+        "live": [
+            {
+                "type": "Live",
+                "day_offset": x["day_offset"],
+                "date": x["date_label"],
+                "cached": x["cached"],
+                "raw": x["raw"],
+                "analytics": x["analytics"],
+            } for x in live_timeline
+        ],
+    }
+
+    db_manager.audit(
+        action="scan_run",
+        query_hash=hashlib.md5((keywords + validation_mode + Config.VERSION_TAG).encode("utf-8")).hexdigest(),
+        keywords=keywords,
+        validation_mode=validation_mode,
+        window_days=window_days,
+        reference_anchor=reference_anchor.isoformat(),
+        live_anchor=live_anchor.isoformat(),
+        meta={"kpis": kpis},
+    )
+
+    return {
+        "ref_timeline": ref_timeline,
+        "live_timeline": live_timeline,
+        "kpis": kpis,
+        "live_anomaly_indices": anomalies,
+        "export_obj": export_obj
+    }
+
+
+if "scan_state" not in st.session_state:
+    st.session_state.scan_state = None
+
+
+colA, colB, colC = st.columns([1, 1, 2])
+with colA:
+    run_btn = st.button("🚀 הפעל סריקה", use_container_width=True)
+with colB:
+    clear_btn = st.button("🧹 נקה תוצאות", use_container_width=True)
+
+if clear_btn:
+    st.session_state.scan_state = None
+    st.rerun()
+
+if run_btn:
+    if not keywords.strip():
+        st.error("מילות חיפוש ריקות.")
+    else:
+        st.session_state.scan_state = run_scan()
+
+state = st.session_state.scan_state
+
+if not state:
+    st.info("בחר הגדרות והפעל סריקה.")
+    st.stop()
+
+ref_timeline = state["ref_timeline"]
+live_timeline = state["live_timeline"]
+kpis = state["kpis"]
+anom_idxs = state["live_anomaly_indices"]
+export_obj = state["export_obj"]
+
+# =========================
+# KPI cards
+# =========================
+k1, k2, k3, k4 = st.columns(4)
+k1.metric("Correlation (Ref↔Live)", f"{kpis['correlation']:.2f}")
+k2.metric("Avg Confidence (Live)", f"{kpis['avg_confidence_live']:.2f}")
+k3.metric("Live Max Score", f"{kpis['live_max_score']:.2f}")
+k4.metric(f"Live Anomalies (|z|≥{Config.ANOMALY_Z_ABS:g})", f"{kpis['live_anomaly_count']}")
+
+# =========================
+# Trend chart
+# =========================
+st.subheader("📈 תמונת מודיעין (Score + Confidence + Trend)")
+
+live_scores = [float(x["analytics"]["escalation_score"]) for x in live_timeline]
+live_conf = [float(x["analytics"]["confidence"]) for x in live_timeline]
+labels = [x["date_label"] for x in live_timeline]
+
+ma3 = moving_average(live_scores, 3)
+ma7 = moving_average(live_scores, 7)
+zs = z_scores(live_scores)
+
+fig = make_subplots(specs=[[{"secondary_y": True}]])
+fig.add_trace(go.Scatter(x=labels, y=live_scores, mode="lines+markers", name="Score"), secondary_y=False)
+fig.add_trace(go.Scatter(x=labels, y=ma3, mode="lines", name="MA(3)"), secondary_y=False)
+fig.add_trace(go.Scatter(x=labels, y=ma7, mode="lines", name="MA(7)"), secondary_y=False)
+
+fig.add_trace(go.Scatter(x=labels, y=live_conf, mode="lines+markers", name="Confidence"), secondary_y=True)
+
+# anomaly markers
+if anom_idxs:
+    fig.add_trace(
+        go.Scatter(
+            x=[labels[i] for i in anom_idxs],
+            y=[live_scores[i] for i in anom_idxs],
+            mode="markers",
+            name="Anomaly",
+            marker=dict(size=12, symbol="x")
+        ),
+        secondary_y=False
+    )
+
+fig.update_layout(height=420, margin=dict(l=10, r=10, t=30, b=10))
+fig.update_yaxes(title_text="Score", secondary_y=False)
+fig.update_yaxes(title_text="Confidence", secondary_y=True)
+st.plotly_chart(fig, use_container_width=True)
+
+# Anomalies table
+if anom_idxs:
+    st.subheader("🧨 חריגות (Anomalies)")
+    adf = pd.DataFrame({
+        "date": [labels[i] for i in anom_idxs],
+        "score": [live_scores[i] for i in anom_idxs],
+        "z": [zs[i] for i in anom_idxs],
+        "confidence": [live_conf[i] for i in anom_idxs],
+    })
+    st.dataframe(adf, use_container_width=True, hide_index=True)
+
+# =========================
+# Evidence Locker
+# =========================
+st.subheader("🔍 חקר ראיות (Evidence Locker)")
+
+tab1, tab2 = st.tabs(["Reference", "Live"])
+
+def render_timeline(timeline: List[Dict[str, Any]]):
+    for day in timeline:
+        score = float(day["analytics"]["escalation_score"])
+        conf = float(day["analytics"]["confidence"])
+        vol = int(day["analytics"]["volume"])
+        err = day["raw"].get("error")
+        debug = day["raw"].get("debug", {}) or {}
+
+        badge = "🟢" if conf >= 0.55 else ("🟡" if conf >= 0.30 else "🔴")
+        title = f"{day['date_label']} | Score: {score:.2f} | Conf: {conf:.2f} {badge} | Vol: {vol}"
+        if err:
+            title += f" | ⚠️ {err}"
+
+        with st.expander(title, expanded=False):
+            # clusters preview
+            for cl in day["analytics"].get("top_clusters", [])[:3]:
+                st.markdown(
+                    f"<div class='cluster-card'><b>{cl['main_title']}</b><br>"
+                    f"Count: {cl['count']} | Unique domains: {cl['unique_domains']} | Max weight: {cl['max_weight']}</div>",
+                    unsafe_allow_html=True
+                )
+
+            # evidence
+            ev = day["analytics"].get("evidence", [])
+            if not ev:
+                st.caption("אין ראיות מאומתות ליום הזה.")
+            else:
+                for e in ev:
+                    tier = "Tier1" if e.get("is_tier1") else "Other"
+                    st.markdown(
+                        f"<a class='evidence-link' href='{e['url']}' target='_blank'>🔗 {e['domain']} ({tier}) — {e['title']}</a>",
+                        unsafe_allow_html=True
+                    )
+
+            if show_debug:
+                st.markdown("<div class='debug-info'>", unsafe_allow_html=True)
+                st.write("debug:", debug)
+                st.markdown("</div>", unsafe_allow_html=True)
+
+with tab1:
+    render_timeline(ref_timeline)
+
+with tab2:
+    render_timeline(live_timeline)
+
+# =========================
+# Assessment (deterministic, no forecasting)
+# =========================
+st.subheader("🧠 הערכת מצב (OSINT בלבד)")
+st.write(build_assessment(live_timeline, kpis))
+
+# =========================
+# Export
+# =========================
+st.subheader("⬇️ יצוא דו״ח")
+
+# JSON
+json_bytes = safe_json_bytes(export_obj, indent=2)
+st.download_button(
+    "הורד JSON",
+    data=json_bytes,
+    file_name="osint_report.json",
+    mime="application/json",
+    use_container_width=True,
+)
+
+# CSV summary (per-day)
+rows = []
+for day in (ref_timeline + live_timeline):
+    rows.append({
+        "type": day["type"],
+        "date": day["date_obj"].isoformat(),
+        "date_label": day["date_label"],
+        "day_offset": day["day_offset"],
+        "score": float(day["analytics"]["escalation_score"]),
+        "confidence": float(day["analytics"]["confidence"]),
+        "volume": int(day["analytics"]["volume"]),
+        "clusters": int(day["analytics"]["clusters"]),
+        "unique_domains": int(day["analytics"]["valid_unique_domains"]),
+        "cached": bool(day["cached"]),
+        "error": str(day["raw"].get("error") or ""),
+        "raw_items": int((day["raw"].get("debug") or {}).get("raw_items", 0) or 0),
+        "validated": int((day["raw"].get("debug") or {}).get("validated", 0) or 0),
+        "strict_fallback_hits": int((day["raw"].get("debug") or {}).get("strict_fallback_hits", 0) or 0),
+    })
+
+summary_df = pd.DataFrame(rows).sort_values(["type", "day_offset"])
+csv_bytes = summary_df.to_csv(index=False).encode("utf-8")
+st.download_button(
+    "הורד CSV (סיכום)",
+    data=csv_bytes,
+    file_name="osint_report_summary.csv",
+    mime="text/csv",
+    use_container_width=True,
+)
+
+# XLSX
+xlsx_buf = io.BytesIO()
+with pd.ExcelWriter(xlsx_buf, engine="openpyxl") as writer:
+    summary_df.to_excel(writer, index=False, sheet_name="summary")
+    pd.DataFrame([to_jsonable(export_obj["meta"])]).to_excel(writer, index=False, sheet_name="meta")
+xlsx_buf.seek(0)
+
+st.download_button(
+    "הורד XLSX",
+    data=xlsx_buf.getvalue(),
+    file_name="osint_report.xlsx",
+    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    use_container_width=True,
+)
