@@ -162,7 +162,6 @@ def fetch_day_data(client, date_obj, keywords, mode="Relaxed"):
     before = date_obj + datetime.timedelta(days=1)
     search_query = f"{keywords} after:{after} before:{before}"
     
-    # הפרומפט החדש עם ההנחיה נגד Aggregators
     prompt = f"""
     ROLE: OSINT Data Extractor.
     TASK: Find specific news items for DATE: {date_str}.
@@ -197,7 +196,6 @@ def fetch_day_data(client, date_obj, keywords, mode="Relaxed"):
             
             grounded_norm, grounded_domains = _extract_grounded_urls(response)
             
-            # בדיקת קצה: יש גראונדינג אבל ה-AI לא החזיר כלום?
             try:
                 raw_data = json.loads(response.text)
                 raw_items = raw_data.get("items", [])
@@ -205,12 +203,10 @@ def fetch_day_data(client, date_obj, keywords, mode="Relaxed"):
                 raw_items = []
                 
             if (grounded_norm or grounded_domains) and not raw_items:
-                # כשל באיסוף למרות שיש מידע
                 err_data = {"items": [], "error": "EMPTY_ITEMS_WITH_GROUNDING", "debug": {"attempts": attempt+1}}
                 save_to_cache(date_str, query_hash, err_data)
                 return err_data, False
             
-            # Fail-Closed רגיל
             if not grounded_norm and not grounded_domains:
                 empty_data = {"items": [], "error": "NO_GROUNDING_SOURCES", "debug": {"attempts": attempt+1}}
                 save_to_cache(date_str, query_hash, empty_data)
@@ -225,7 +221,6 @@ def fetch_day_data(client, date_obj, keywords, mode="Relaxed"):
                 u_norm = _normalize_url(u)
                 u_domain = _get_domain(u)
                 
-                # סינון Aggregators
                 if u_domain in AGGREGATORS: continue
                 
                 is_valid = False
@@ -259,14 +254,12 @@ def analyze_data_points(items, tier1_list):
     df = pd.DataFrame(items)
     df["domain"] = df["url"].apply(_get_domain)
     
-    # ניקוי אגרגטורים נוסף ליתר ביטחון
     df = df[~df["domain"].isin(AGGREGATORS)]
     if df.empty:
          return {"volume": 0, "clusters": 0, "tier1_ratio": 0, "escalation_score": 0, "confidence": 0, "top_clusters": [], "evidence": []}
 
     df["text"] = (df["title"] + " " + df["snippet"].fillna("")).str.strip()
     
-    # 1. Clustering
     clusters = []
     if len(df) > 1 and df["text"].str.len().sum() > 0:
         vectorizer = TfidfVectorizer(analyzer="char_wb", ngram_range=(3, 5), min_df=1)
@@ -289,12 +282,11 @@ def analyze_data_points(items, tier1_list):
                 "main_title": part.iloc[0]["title"],
                 "count": len(part),
                 "unique_domains": part["domain"].nunique(),
-                "indices": idxs # לשליפת ראיות
+                "indices": idxs
             })
     else:
         clusters = [{"main_title": df.iloc[0]["title"], "count": 1, "unique_domains": 1, "indices": [0]}]
 
-    # 2. חישובים משודרגים
     tier1_set = {x.strip().lower().replace("www.", "") for x in tier1_list.split(",") if x.strip()}
     
     unique_domains_today = set(df["domain"].unique()) - {""}
@@ -303,45 +295,32 @@ def analyze_data_points(items, tier1_list):
     tier1_ratio = tier1_unique_count / max(1, len(unique_domains_today))
     
     unique_stories = len(clusters)
-    # עקביות: מוגבל לתקרה של 4 דומיינים לסיפור
     total_domain_power = sum(c['unique_domains'] for c in clusters)
     avg_sources = min((total_domain_power / unique_stories), 4) if unique_stories else 0
 
-    # 3. ציון דטרמיניסטי (עם בונוס ייחודיות)
-    # Tier 1 Unique Bonus: עד 10 נקודות בונוס על גיוון במקורות איכות
     tier1_bonus = min(10, tier1_unique_count * 2)
-    
     score = (unique_stories * 4) + (tier1_ratio * 30) + (avg_sources * 5) + tier1_bonus
     
-    # 4. ענישת Confidence
-    # בסיס
     conf_clusters = min(1.0, unique_stories / 5)
     conf_vol = min(1.0, len(unique_domains_today) / 6)
     
     confidence = (0.35 * conf_clusters) + (0.45 * tier1_ratio) + (0.20 * conf_vol)
     
-    # עונשין (Penalty Box): אם אין מספיק דאטה, הביטחון צונח
     if len(unique_domains_today) < 3 or unique_stories < 2:
         confidence = min(confidence, 0.25)
         
     confidence = round(confidence, 2)
 
-    # 5. בחירת ראיות חכמה (Moneyshot): אחד מכל קלאסטר
     evidence = []
     top_clusters = sorted(clusters, key=lambda x: x["count"], reverse=True)[:5]
     
     for cl in top_clusters:
-        # בתוך הקלאסטר, נחפש את הלינק הכי טוב (Tier 1)
         cluster_df = df.iloc[cl['indices']]
         best_row = None
-        
-        # נסה למצוא Tier 1
         for _, row in cluster_df.iterrows():
             if _is_tier1(row['domain'], tier1_set):
                 best_row = row
                 break
-        
-        # אם לא מצאת, קח את הראשון (שהוא לרוב הכי רלוונטי לפי TF-IDF)
         if best_row is None:
             best_row = cluster_df.iloc[0]
             
@@ -358,7 +337,7 @@ def analyze_data_points(items, tier1_list):
         "tier1_ratio": round(tier1_ratio, 2),
         "escalation_score": float(min(score, 100)),
         "confidence": confidence,
-        "top_clusters": top_clusters[:3], # לתצוגת כרטיסיות
+        "top_clusters": top_clusters[:3],
         "evidence": evidence
     }
 
@@ -372,12 +351,12 @@ if st.button("🚀 הפעל ניתוח מבצעי (Production)", type="primary")
         status_text = st.empty()
         prog_bar = st.progress(0)
         
+        # --- תיקון: שימוש במילון לניהול המצב במקום nonlocal ---
+        state = {"step": 0}
         total_steps = (window + 1) * 2
-        step_counter = 0
         
         def scan_timeline(anchor_date, label):
             timeline_data = []
-            nonlocal step_counter
             for i in range(window, -1, -1):
                 target_date = anchor_date - datetime.timedelta(days=i)
                 status_text.markdown(f"**{label}**: סורק את {target_date.strftime('%d/%m/%Y')}...")
@@ -396,8 +375,9 @@ if st.button("🚀 הפעל ניתוח מבצעי (Production)", type="primary")
                     "error": raw_data.get("error", None)
                 })
                 
-                step_counter += 1
-                prog_bar.progress(step_counter / total_steps)
+                # עדכון המונה דרך המילון
+                state["step"] += 1
+                prog_bar.progress(state["step"] / total_steps)
                 if not is_cached: time.sleep(0.5)
             return timeline_data
 
@@ -407,14 +387,12 @@ if st.button("🚀 הפעל ניתוח מבצעי (Production)", type="primary")
             
         status_text.empty()
         
-        # --- ויזואליזציה (Dual Axis) ---
+        # --- ויזואליזציה ---
         st.divider()
         st.subheader("📈 תמונת מודיעין משולבת (Signal vs Noise)")
         
-        # שימוש ב-Subplots לצירים כפולים
         fig = make_subplots(specs=[[{"secondary_y": True}]])
         
-        # קווי Score
         fig.add_trace(go.Scatter(
             x=[x['day_offset'] for x in past_timeline], y=[x['score'] for x in past_timeline],
             name="Score (Ref)", line=dict(color='#ef5350', width=2, dash='dot')
@@ -425,7 +403,6 @@ if st.button("🚀 הפעל ניתוח מבצעי (Production)", type="primary")
             name="Score (Live)", line=dict(color='#4285f4', width=3)
         ), secondary_y=False)
         
-        # עמודי Confidence (רק ל-Live)
         fig.add_trace(go.Bar(
             x=[x['day_offset'] for x in curr_timeline], y=[x['confidence'] for x in curr_timeline],
             name="Confidence (Live)", marker_color='rgba(66, 133, 244, 0.2)'
@@ -437,7 +414,7 @@ if st.button("🚀 הפעל ניתוח מבצעי (Production)", type="primary")
         
         st.plotly_chart(fig, use_container_width=True)
         
-        # --- חקר נתונים (Evidence Locker) ---
+        # --- חקר נתונים ---
         st.divider()
         st.subheader("🔍 חקר נתונים וראיות")
         
@@ -450,7 +427,6 @@ if st.button("🚀 הפעל ניתוח מבצעי (Production)", type="primary")
                 with st.expander(f"{day['date']} | Score: {day['score']:.1f} | Conf: {day['confidence']} {conf_icon}"):
                     if day.get('error'): st.error(day['error'])
                     
-                    # ראיות (לינקים) בראש סדר העדיפויות
                     if day['evidence']:
                         st.markdown("**🔗 ראיות נבחרות (Diverse Sources):**")
                         for ev in day['evidence']:
@@ -459,7 +435,6 @@ if st.button("🚀 הפעל ניתוח מבצעי (Production)", type="primary")
                     else:
                         st.caption("אין ראיות מאומתות.")
                         
-                    # דיבאג בתחתית
                     dbg = day.get('debug', {})
                     if dbg:
                         st.markdown(f"<div class='debug-info'>Fetched: {dbg.get('fetched')} | Valid: {dbg.get('valid')}</div>", unsafe_allow_html=True)
