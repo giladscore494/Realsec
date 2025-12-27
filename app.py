@@ -2,19 +2,17 @@
 """
 🛡️ OSINT Sentinel: Platinum v1.5.1 (Fixed)
 - Smart Strict validation (prevents "validated=0" flatline)
-- Global rate limiter + client pool (thread-safe)
+- Global rate limiter + Gemini client pool (thread-safe)
 - Robust JSON export (no "not JSON serializable" TypeError)
 - Evidence locker + Trends + Anomalies (z-score)
 - SQLite WAL + daily cache + audit log
 """
 
 import re
-import os
 import io
 import json
 import time
 import hmac
-import math
 import queue
 import hashlib
 import random
@@ -60,7 +58,7 @@ class Config:
     MAX_WORKERS: int = 3
     MAX_RETRIES: int = 3
 
-    # Models (keep as strings; allow override via secrets if needed)
+    # Models (Gemini API)
     FLASH_MODEL: str = "gemini-3-flash-preview"
     PRO_MODEL: str = "gemini-3-pro-preview"
 
@@ -97,11 +95,8 @@ class Config:
 
 DOMAIN_WEIGHTS = {
     "reuters.com": 1.0, "apnews.com": 1.0, "bbc.com": 1.0, "cnn.com": 0.9,
-
     "ynet.co.il": 0.85, "haaretz.co.il": 0.85, "timesofisrael.com": 0.85,
-
     "jpost.com": 0.80, "maariv.co.il": 0.75, "walla.co.il": 0.75,
-
     "aljazeera.com": 0.70, "tasnimnews.com": 0.60, "isna.ir": 0.60,
     "iranintl.com": 0.65
 }
@@ -136,11 +131,15 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-st.warning(
-    "⚖️ מערכת זו נועדה למחקר ואנליזה של מידע פומבי בלבד (OSINT). "
-    "היא מציגה סטטיסטיקה של שיח תקשורתי ואינה מספקת התרעות, תחזיות תקיפה או ייעוץ אופרטיבי."
-)
+# חובה: Disclaimer בתחילת האפליקציה (בדיוק בפורמט המבוקש)
+st.warning("""
+⚖️ **הצהרת אחריות**
+מערכת זו נועדה למחקר ואנליזה של מידע פומבי בלבד.
+אין להשתמש במידע למטרות בלתי חוקיות.
+המשתמש אחראי לציות לכל החוקים הרלוונטיים.
+""")
 
+st.info("המערכת מציגה סטטיסטיקה של שיח תקשורתי (OSINT) ואינה מספקת התרעות, תחזיות תקיפה או ייעוץ אופרטיבי.")
 st.title(Config.APP_TITLE)
 st.caption("Advanced OSINT I&W: Concurrency-safe, Rate-limited, Weighted Evidence + Trends/Anomalies (No forecasting)")
 
@@ -217,15 +216,12 @@ def to_jsonable(obj: Any) -> Any:
     if obj is None:
         return None
 
-    # primitives
     if isinstance(obj, (str, int, float, bool)):
         return obj
 
-    # datetime
     if isinstance(obj, (datetime.datetime, datetime.date)):
         return obj.isoformat()
 
-    # numpy
     if isinstance(obj, (np.integer,)):
         return int(obj)
     if isinstance(obj, (np.floating,)):
@@ -233,26 +229,21 @@ def to_jsonable(obj: Any) -> Any:
     if isinstance(obj, (np.ndarray,)):
         return obj.tolist()
 
-    # pandas
     if isinstance(obj, (pd.Timestamp,)):
         return obj.isoformat()
 
-    # bytes
     if isinstance(obj, (bytes, bytearray)):
         try:
             return obj.decode("utf-8", errors="replace")
         except Exception:
             return str(obj)
 
-    # dict
     if isinstance(obj, dict):
         return {str(k): to_jsonable(v) for k, v in obj.items()}
 
-    # list/tuple/set
     if isinstance(obj, (list, tuple, set)):
         return [to_jsonable(x) for x in list(obj)]
 
-    # fallback
     return str(obj)
 
 
@@ -335,6 +326,7 @@ class SQLitePool:
             conn = sqlite3.connect(self.db_file, check_same_thread=False)
             conn.execute("PRAGMA journal_mode=WAL;")
             conn.execute("PRAGMA synchronous=NORMAL;")
+            conn.execute("PRAGMA busy_timeout=5000;")  # ↓ reduce "database is locked"
             self.pool.put(conn)
 
     def get(self) -> sqlite3.Connection:
@@ -371,7 +363,10 @@ class DatabaseManager:
             row = cur.fetchone()
             if not row:
                 return None
-            return json.loads(row[0])
+            try:
+                return json.loads(row[0])
+            except Exception:
+                return None
         finally:
             self.pool.put(conn)
 
@@ -469,7 +464,6 @@ class GeminiScanner:
                     if d and not is_aggregator_domain(d):
                         grounded_domains.add(d)
 
-                # sometimes "title" is a bare domain-like string
                 if title and "." in title and " " not in title:
                     d2 = title.lower().replace("www.", "")
                     if len(d2) > 3 and not is_aggregator_domain(d2):
@@ -546,12 +540,10 @@ JSON SCHEMA:
             if u_key in grounded_keys:
                 ok = True
             else:
-                # domain-level
                 if mode == "Relaxed":
                     if d in grounded_domains:
                         ok = True
                 else:  # Strict
-                    # Smart-Strict: only allow domain-level validation for Tier1-ish
                     if d in grounded_domains and domain_weight(d) >= Config.STRICT_DOMAIN_FALLBACK_MIN_WEIGHT:
                         ok = True
                         dbg["strict_fallback_hits"] += 1
@@ -606,7 +598,6 @@ JSON SCHEMA:
 
             validated_items, dbg2 = self._validate_items(raw_items, grounded_keys, grounded_domains, mode)
 
-            # error signals
             err = None
             if (grounded_keys or grounded_domains) and not raw_items:
                 err = "EMPTY_ITEMS_WITH_GROUNDING"
@@ -668,14 +659,12 @@ class DataAnalyzer:
         df["url_norm"] = df["url"].apply(normalize_url)
         df["domain"] = df["url_norm"].apply(get_domain)
 
-        # hard filters
         df = df[~df["domain"].isin(Config.BLACKLIST_DOMAINS)]
         df = df[~df["domain"].apply(is_aggregator_domain)]
 
         if df.empty:
             return self._empty()
 
-        # dedup: fingerprint + url_norm
         df["fp"] = df.apply(lambda r: self._fingerprint(r["title"], r["snippet"]), axis=1)
         df = df.drop_duplicates("fp")
         df = df.drop_duplicates("url_norm")
@@ -683,9 +672,7 @@ class DataAnalyzer:
         if df.empty:
             return self._empty()
 
-        # weights
         df["weight"] = df["domain"].apply(domain_weight).astype(float)
-
         df["text"] = (df["title"] + " " + df["snippet"]).str.strip()
 
         clusters = []
@@ -735,7 +722,6 @@ class DataAnalyzer:
         score = (unique_stories * 3.0) + (weighted_volume * 5.0) + (avg_cluster_quality * 20.0)
         score = float(min(score, 100.0))
 
-        # confidence: calibrated
         conf = avg_cluster_quality
         domain_count = len(unique_domains)
         scarcity_penalty = 1.0
@@ -745,7 +731,6 @@ class DataAnalyzer:
             scarcity_penalty *= 0.6
         conf = float(max(0.0, min(1.0, conf * scarcity_penalty)))
 
-        # evidence: pick best from top clusters
         evidence = []
         top_clusters = sorted(clusters, key=lambda x: (x["max_weight"], x["count"]), reverse=True)[:5]
         seen = set()
@@ -832,7 +817,6 @@ def z_scores(arr: List[float]) -> List[float]:
 
 
 def build_assessment(live_rows: List[Dict[str, Any]], kpis: Dict[str, Any]) -> str:
-    # deterministic, no forecasting
     max_score = float(kpis.get("live_max_score", 0.0) or 0.0)
     avg_conf = float(kpis.get("avg_confidence_live", 0.0) or 0.0)
     anom = int(kpis.get("live_anomaly_count", 0) or 0)
@@ -843,7 +827,7 @@ def build_assessment(live_rows: List[Dict[str, Any]], kpis: Dict[str, Any]) -> s
     if max_score == 0.0 and avg_conf == 0.0:
         return (
             "לא אותר סיגנל תקשורתי מאומת בטווח הנבדק. "
-            "אם זה לא הגיוני מול המציאות, בדוק: מילות מפתח, מצב אימות (Strict/Relaxed), ומקורות."
+            "אם זה לא הגיוני מול המציאות, בדוק: מילות מפתח, מצב אימות (Strict/Relaxed), ומכסת API."
         )
 
     lines = []
@@ -856,12 +840,12 @@ def build_assessment(live_rows: List[Dict[str, Any]], kpis: Dict[str, Any]) -> s
         lines.append("יש פעילות תקשורתית חלשה/מפוזרת (OSINT).")
 
     if anom > 0:
-        lines.append("זוהתה חריגה סטטיסטית לפחות פעם אחת (z-score). זה מצדיק בדיקה ידנית של הראיות.")
+        lines.append("זוהתה חריגה סטטיסטית (z-score). זה מצדיק בדיקה ידנית של הראיות.")
     return "\n".join(lines)
 
 
 # =========================
-# Secrets / Access
+# Secrets / Access (No UI API key input)
 # =========================
 GOOGLE_API_KEY = st.secrets.get("GOOGLE_API_KEY", "")
 if not GOOGLE_API_KEY:
@@ -904,11 +888,15 @@ with st.sidebar:
 # =========================
 # Execution
 # =========================
-rate_limiter = GlobalRateLimiter(min_interval=Config.MIN_INTERVAL_SEC, jitter=Config.JITTER_SEC)
+@st.cache_resource
+def get_rate_limiter() -> GlobalRateLimiter:
+    return GlobalRateLimiter(min_interval=Config.MIN_INTERVAL_SEC, jitter=Config.JITTER_SEC)
+
+rate_limiter = get_rate_limiter()
 
 
-def process_day(scanner: GeminiScanner, d: datetime.date, keywords: str, mode: str) -> Dict[str, Any]:
-    raw_data, cached = scanner.fetch_day(d, keywords, mode)
+def process_day(scanner: GeminiScanner, d: datetime.date, keywords_: str, mode_: str) -> Dict[str, Any]:
+    raw_data, cached = scanner.fetch_day(d, keywords_, mode_)
     analytics = analyzer.analyze(raw_data.get("items", []))
     return {
         "date_obj": d,
@@ -940,9 +928,7 @@ def run_scan() -> Dict[str, Any]:
     all_dates = [("Reference", d) for d in ref_dates] + [("Live", d) for d in live_dates]
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=Config.MAX_WORKERS) as ex:
-        futures = {}
-        for typ, d in all_dates:
-            futures[ex.submit(process_day, scanner, d, keywords, validation_mode)] = (typ, d)
+        futures = {ex.submit(process_day, scanner, d, keywords, validation_mode): (typ, d) for typ, d in all_dates}
 
         for fut in concurrent.futures.as_completed(futures):
             typ, d = futures[fut]
@@ -966,7 +952,6 @@ def run_scan() -> Dict[str, Any]:
     ref_timeline = sorted([v for v in results_map.values() if v["type"] == "Reference"], key=lambda x: x["day_offset"])
     live_timeline = sorted([v for v in results_map.values() if v["type"] == "Live"], key=lambda x: x["day_offset"])
 
-    # KPI
     ref_scores = [float(x["analytics"]["escalation_score"]) for x in ref_timeline]
     live_scores = [float(x["analytics"]["escalation_score"]) for x in live_timeline]
     corr = pearson_corr(ref_scores, live_scores)
@@ -1042,7 +1027,6 @@ def run_scan() -> Dict[str, Any]:
 if "scan_state" not in st.session_state:
     st.session_state.scan_state = None
 
-
 colA, colB, colC = st.columns([1, 1, 2])
 with colA:
     run_btn = st.button("🚀 הפעל סריקה", use_container_width=True)
@@ -1060,7 +1044,6 @@ if run_btn:
         st.session_state.scan_state = run_scan()
 
 state = st.session_state.scan_state
-
 if not state:
     st.info("בחר הגדרות והפעל סריקה.")
     st.stop()
@@ -1097,10 +1080,8 @@ fig = make_subplots(specs=[[{"secondary_y": True}]])
 fig.add_trace(go.Scatter(x=labels, y=live_scores, mode="lines+markers", name="Score"), secondary_y=False)
 fig.add_trace(go.Scatter(x=labels, y=ma3, mode="lines", name="MA(3)"), secondary_y=False)
 fig.add_trace(go.Scatter(x=labels, y=ma7, mode="lines", name="MA(7)"), secondary_y=False)
-
 fig.add_trace(go.Scatter(x=labels, y=live_conf, mode="lines+markers", name="Confidence"), secondary_y=True)
 
-# anomaly markers
 if anom_idxs:
     fig.add_trace(
         go.Scatter(
@@ -1118,7 +1099,6 @@ fig.update_yaxes(title_text="Score", secondary_y=False)
 fig.update_yaxes(title_text="Confidence", secondary_y=True)
 st.plotly_chart(fig, use_container_width=True)
 
-# Anomalies table
 if anom_idxs:
     st.subheader("🧨 חריגות (Anomalies)")
     adf = pd.DataFrame({
@@ -1133,8 +1113,8 @@ if anom_idxs:
 # Evidence Locker
 # =========================
 st.subheader("🔍 חקר ראיות (Evidence Locker)")
-
 tab1, tab2 = st.tabs(["Reference", "Live"])
+
 
 def render_timeline(timeline: List[Dict[str, Any]]):
     for day in timeline:
@@ -1150,7 +1130,6 @@ def render_timeline(timeline: List[Dict[str, Any]]):
             title += f" | ⚠️ {err}"
 
         with st.expander(title, expanded=False):
-            # clusters preview
             for cl in day["analytics"].get("top_clusters", [])[:3]:
                 st.markdown(
                     f"<div class='cluster-card'><b>{cl['main_title']}</b><br>"
@@ -1158,7 +1137,6 @@ def render_timeline(timeline: List[Dict[str, Any]]):
                     unsafe_allow_html=True
                 )
 
-            # evidence
             ev = day["analytics"].get("evidence", [])
             if not ev:
                 st.caption("אין ראיות מאומתות ליום הזה.")
@@ -1174,6 +1152,7 @@ def render_timeline(timeline: List[Dict[str, Any]]):
                 st.markdown("<div class='debug-info'>", unsafe_allow_html=True)
                 st.write("debug:", debug)
                 st.markdown("</div>", unsafe_allow_html=True)
+
 
 with tab1:
     render_timeline(ref_timeline)
@@ -1192,7 +1171,6 @@ st.write(build_assessment(live_timeline, kpis))
 # =========================
 st.subheader("⬇️ יצוא דו״ח")
 
-# JSON
 json_bytes = safe_json_bytes(export_obj, indent=2)
 st.download_button(
     "הורד JSON",
@@ -1202,7 +1180,6 @@ st.download_button(
     use_container_width=True,
 )
 
-# CSV summary (per-day)
 rows = []
 for day in (ref_timeline + live_timeline):
     rows.append({
@@ -1232,7 +1209,6 @@ st.download_button(
     use_container_width=True,
 )
 
-# XLSX
 xlsx_buf = io.BytesIO()
 with pd.ExcelWriter(xlsx_buf, engine="openpyxl") as writer:
     summary_df.to_excel(writer, index=False, sheet_name="summary")
