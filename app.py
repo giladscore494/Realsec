@@ -1,256 +1,287 @@
 import streamlit as st
 import datetime
 import pandas as pd
+import numpy as np
 import time
+import json
+import sqlite3
+import hashlib
 import plotly.graph_objects as go
 from google import genai
 from google.genai import types
-import json
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
 
 # --- הגדרת עמוד ---
-st.set_page_config(layout="wide", page_title="OSINT Gemini 3 - Deep Scan")
+st.set_page_config(layout="wide", page_title="OSINT Sentinel: Gemini 3")
 
 # --- עיצוב CSS ---
 st.markdown("""
 <style>
     .stTextInput > label, .stSelectbox > label, .stDateInput > label, .stSlider > label { 
-        direction: rtl; text-align: right; font-weight: bold; font-size: 1.1rem; 
+        direction: rtl; text-align: right; font-weight: bold; 
     }
-    .stMarkdown, div[data-testid="stSidebar"], div[data-testid="stText"], .stAlert, .stExpander { 
+    .stMarkdown, div[data-testid="stSidebar"], div[data-testid="stText"], .stExpander { 
         direction: rtl; text-align: right; 
     }
     h1, h2, h3, h4 { text-align: right; }
     
-    .source-link {
-        font-size: 0.8em; color: #4285f4; text-decoration: none; display: block;
+    .cluster-card {
+        border-right: 3px solid #4285f4; padding-right: 10px; margin-bottom: 10px;
+        background-color: #ffffff; padding: 8px; border-radius: 4px;
+        box-shadow: 0 1px 3px rgba(0,0,0,0.1);
     }
-    .source-link:hover { text-decoration: underline; }
-    
-    .day-card-risk-high { border-right: 5px solid #ff4444; padding-right: 10px; }
-    .day-card-risk-med { border-right: 5px solid #ffa500; padding-right: 10px; }
-    .day-card-risk-low { border-right: 5px solid #00c851; padding-right: 10px; }
 </style>
 """, unsafe_allow_html=True)
 
-st.title("🕵️‍♂️ מערכת OSINT: השוואת דפוסים (Gemini 3 Engine)")
-st.caption("סריקה יומית כירורגית עם חשיפת מקורות מלאה")
+st.title("🛡️ OSINT Sentinel: מנוע Gemini 3")
+st.caption("מערכת התרעה דטרמיניסטית המופעלת על ידי Gemini 3 Flash & Pro")
 
-# --- סרגל צד ---
+# --- 1. ניהול Cache (SQLite) ---
+DB_FILE = "osint_cache_v3.db"
+
+def init_db():
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('''CREATE TABLE IF NOT EXISTS daily_scans
+                 (scan_date TEXT, query_hash TEXT, raw_json TEXT, updated_at TIMESTAMP)''')
+    conn.commit()
+    conn.close()
+
+def get_from_cache(date_str, query_hash):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("SELECT raw_json FROM daily_scans WHERE scan_date=? AND query_hash=?", (date_str, query_hash))
+    data = c.fetchone()
+    conn.close()
+    return json.loads(data[0]) if data else None
+
+def save_to_cache(date_str, query_hash, data):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("DELETE FROM daily_scans WHERE scan_date=? AND query_hash=?", (date_str, query_hash))
+    c.execute("INSERT INTO daily_scans VALUES (?, ?, ?, ?)", 
+              (date_str, query_hash, json.dumps(data), datetime.datetime.now()))
+    conn.commit()
+    conn.close()
+
+init_db()
+
+# --- 2. הגדרות צד ---
 with st.sidebar:
-    st.header("⚙️ הגדרות מנוע")
+    st.header("⚙️ הגדרות סנסור")
+    api_key = st.secrets.get("GOOGLE_API_KEY") or st.text_input("Google API Key", type="password")
     
-    api_key = st.secrets.get("GOOGLE_API_KEY")
-    if not api_key:
-        api_key = st.text_input("Google API Key", type="password")
-
     st.divider()
-    st.subheader("📆 הגדרת זמנים")
-
-    # עוגן עבר: 15 ביוני 2025
-    attack_date = st.date_input("תאריך התקיפה (עבר):", value=datetime.date(2025, 6, 15))
+    st.subheader("📡 טווחי זמן")
+    attack_date = st.date_input("תאריך אירוע עבר (Reference):", datetime.date(2025, 6, 15))
+    today_date = st.date_input("תאריך נוכחי (Live):", datetime.date(2025, 12, 28))
+    window = st.slider("חלון סריקה (ימים):", 7, 45, 20)
     
-    # עוגן הווה: היום
-    today_date = st.date_input("תאריך נוכחי (הווה):", value=datetime.date(2025, 12, 27))
-    
-    # חלון סריקה - ברירת מחדל 33 יום
-    scan_window = st.slider("טווח סריקה לאחור (ימים):", 10, 60, 33)
-
     st.divider()
+    st.subheader("🎛️ מודלים ופרמטרים")
+    st.info("Scanner: Gemini 3 Flash Preview")
+    st.info("Analyst: Gemini 3 Pro Preview")
     
-    # בחירת המודל ללולאה (המהיר)
-    loop_model = st.selectbox(
-        "מודל סריקה יומית (Loop):",
-        ["gemini-3-flash-preview", "gemini-2.0-flash-exp"],
-        index=0,
-        help="Gemini 3 Flash הוא המהיר והחזק ביותר לניתוח כמויות מידע."
-    )
-    
-    # בחירת המודל לסיכום (החכם)
-    reasoning_model = st.selectbox(
-        "מודל סיכום והסקה (Brain):",
-        ["gemini-3-pro-preview", "gemini-1.5-pro-latest"],
-        index=0,
-        help="Gemini 3 Pro הוא בעל יכולות ההסקה הגבוהות ביותר כרגע."
-    )
+    tier1_domains = st.text_area("מקורות איכות (Tier 1):", 
+                                 "reuters.com, apnews.com, bbc.com, ynet.co.il, haaretz.co.il, isna.ir, tasnimnews.com",
+                                 height=70)
+    keywords = st.text_input("מילות חיפוש:", "Iran Israel military conflict missile attack nuclear")
 
-    keywords = st.text_input("מילות מפתח:", value='Iran Israel conflict military tension attack')
-    alert_threshold = st.slider("סף התראה (ציון):", 60, 95, 80)
-
-# --- פונקציה לניתוח יום בודד + חילוץ מקורות ---
-def analyze_single_day(client, date_obj, keywords, model):
+# --- 3. מנוע איסוף (Gemini 3 Flash) ---
+def fetch_day_data(client, date_obj, keywords):
     date_str = date_obj.strftime('%Y-%m-%d')
+    query_hash = hashlib.md5((date_str + keywords).encode()).hexdigest()
     
-    prompt = f"""You are an intelligence analyst. 
-    MANDATORY: Use Google Search to find news from exactly {date_str} about: {keywords}.
-    Ignore news from other dates.
+    cached = get_from_cache(date_str, query_hash)
+    if cached: return cached, True
 
-    Output JSON:
+    # שאילתת תאריך קשיחה
+    search_query = f"{keywords} after:{date_obj - datetime.timedelta(days=1)} before:{date_obj + datetime.timedelta(days=1)}"
+    
+    prompt = f"""
+    ROLE: OSINT Data Extractor.
+    TASK: Use Google Search to find specific news items for DATE: {date_str}.
+    QUERY: "{search_query}"
+    
+    INSTRUCTIONS:
+    1. Retrieve a list of distinct news items / reports from that specific day.
+    2. Ignore generic opinion pieces; focus on factual events.
+    3. Return ONLY a JSON object with this schema:
+    
     {{
-        "score": <0-100 escalation level>,
-        "summary": "<1 sentence summary of the specific events of that day>",
-        "key_event": "<Short title of main event>"
+      "items": [
+        {{
+          "title": "Headline",
+          "source": "Publisher Name",
+          "url": "Link",
+          "snippet": "Short summary",
+          "published_date": "YYYY-MM-DD"
+        }}
+      ]
     }}
     """
     
-    result = {"score": 0, "summary": "No data", "key_event": "-", "sources": []}
-    
     try:
+        # שימוש במודל Gemini 3 Flash Preview לאיסוף מהיר
         response = client.models.generate_content(
-            model=model,
+            model="gemini-3-flash-preview", 
             contents=prompt,
             config=types.GenerateContentConfig(
-                temperature=0.1,
+                temperature=0.0,
                 response_mime_type="application/json",
-                tools=[{'google_search': {}}] # מחייב חיפוש
+                tools=[{'google_search': {}}]
             )
         )
         
-        # 1. חילוץ המידע הסמנטי
-        try:
-            data = json.loads(response.text)
-            result.update(data)
-        except:
-            # Fallback ידני אם ה-JSON נשבר
-            import re
-            score_match = re.search(r'"score":\s*(\d+)', response.text)
-            if score_match: result['score'] = int(score_match.group(1))
-            result['summary'] = "Manual extraction from raw text"
-
-        # 2. חילוץ מקורות (Grounding Metadata)
-        # בודקים איפה Gemini החביא את הלינקים
-        if response.candidates and response.candidates[0].grounding_metadata:
-            chunks = response.candidates[0].grounding_metadata.grounding_chunks
-            if chunks:
-                for chunk in chunks:
-                    if chunk.web:
-                        result['sources'].append({
-                            "title": chunk.web.title or "Source",
-                            "url": chunk.web.uri
-                        })
-                        
+        data = json.loads(response.text)
+        save_to_cache(date_str, query_hash, data)
+        return data, False
+        
     except Exception as e:
-        result['summary'] = f"Error: {str(e)[:50]}"
-        
-    return result
+        return {"items": [], "error": str(e)}, False
 
-# --- פונקציית עזר להצגת כרטיסייה יומית ---
-def render_day_card(data):
-    color_class = "day-card-risk-low"
-    if data['score'] > 80: color_class = "day-card-risk-high"
-    elif data['score'] > 50: color_class = "day-card-risk-med"
+# --- 4. מנוע אנליטי (Python Deterministic) ---
+def analyze_data_points(items, tier1_list):
+    """חישוב מדדים מתמטי ללא AI"""
+    if not items:
+        return {"volume": 0, "clusters": 0, "tier1_ratio": 0, "escalation_score": 0, "top_clusters": []}
     
-    with st.expander(f"{data['date']} | ציון: {data['score']} | {data['key_event']}", expanded=False):
-        st.markdown(f"<div class='{color_class}'>{data['summary']}</div>", unsafe_allow_html=True)
+    df = pd.DataFrame(items)
+    df['text'] = df['title'] + " " + df['snippet'].fillna("")
+    
+    # Clustering (Deduplication)
+    if len(df) > 1:
+        vectorizer = TfidfVectorizer(stop_words='english')
+        tfidf_matrix = vectorizer.fit_transform(df['text'])
+        cosine_sim = cosine_similarity(tfidf_matrix)
         
-        if data['sources']:
-            st.markdown("---")
-            st.caption("מקורות מידע:")
-            for src in data['sources']:
-                st.markdown(f"🔗 [{src['title']}]({src['url']})", unsafe_allow_html=True)
-        else:
-            st.caption("לא נמצאו מקורות דיגיטליים מאומתים.")
+        clusters = []
+        visited = set()
+        
+        for i in range(len(df)):
+            if i in visited: continue
+            cluster_indices = [i]
+            visited.add(i)
+            for j in range(i+1, len(df)):
+                if j in visited: continue
+                if cosine_sim[i][j] > 0.6: # סף דמיון
+                    cluster_indices.append(j)
+                    visited.add(j)
+            
+            cluster_items = df.iloc[cluster_indices]
+            clusters.append({
+                "main_title": cluster_items.iloc[0]['title'],
+                "count": len(cluster_items),
+                "sources": cluster_items['source'].unique().tolist()
+            })
+    else:
+        clusters = [{"main_title": df.iloc[0]['title'], "count": 1, "sources": [df.iloc[0]['source']]}]
 
-# --- לוגיקה ראשית ---
-if st.button("🚀 הפעל סריקת עומק (Gemini 3)", type="primary"):
+    # חישוב ציון דטרמיניסטי
+    unique_stories = len(clusters)
+    tier1_sources = [s.strip().lower() for s in tier1_list.split(',')]
+    tier1_count = df['source'].astype(str).apply(lambda x: any(t in x.lower() for t in tier1_sources)).sum()
+    tier1_ratio = round(tier1_count / len(df), 2) if len(df) > 0 else 0
+    avg_sources = len(df) / unique_stories if unique_stories > 0 else 0
+    
+    # הנוסחה המתמטית
+    score = (unique_stories * 4) + (tier1_ratio * 30) + (avg_sources * 5)
+    
+    return {
+        "volume": len(df),
+        "clusters": unique_stories,
+        "escalation_score": min(score, 100),
+        "top_clusters": sorted(clusters, key=lambda x: x['count'], reverse=True)[:3]
+    }
+
+# --- 5. לוגיקה ראשית ---
+if st.button("🚀 הפעל ניתוח (Gemini 3 Engine)", type="primary"):
     if not api_key:
         st.error("חסר מפתח API")
     else:
         client = genai.Client(api_key=api_key)
         
-        past_data = []
-        curr_data = []
+        status_text = st.empty()
+        prog_bar = st.progress(0)
         
-        col_past, col_curr = st.columns(2)
+        total_steps = (window + 1) * 2
+        step_counter = 0
         
-        # --- לולאת העבר ---
-        with col_past:
-            st.subheader(f"📜 יוני 2025 (לפני הפיצוץ)")
-            prog1 = st.progress(0)
-            status1 = st.empty()
-            
-            for i in range(scan_window, -1, -1):
-                curr_date = attack_date - datetime.timedelta(days=i)
-                status1.text(f"סורק: {curr_date.strftime('%d/%m/%Y')}...")
-                prog1.progress((scan_window - i) / (scan_window + 1))
+        def scan_timeline(anchor_date, label):
+            timeline_data = []
+            nonlocal step_counter
+            for i in range(window, -1, -1):
+                target_date = anchor_date - datetime.timedelta(days=i)
+                status_text.markdown(f"**{label}**: סורק את {target_date.strftime('%d/%m/%Y')}...")
                 
-                res = analyze_single_day(client, curr_date, keywords, loop_model)
-                res['date'] = curr_date.strftime('%d/%m')
-                res['day_index'] = -(scan_window - i)
-                past_data.append(res)
+                raw_data, is_cached = fetch_day_data(client, target_date, keywords)
+                analytics = analyze_data_points(raw_data.get('items', []), tier1_domains)
                 
-                # הצגה בזמן אמת
-                render_day_card(res)
-                # time.sleep(0.1) # אופציונלי: למנוע חסימה אם יש הרבה בקשות
-            
-            st.success("סריקת עבר הושלמה")
+                timeline_data.append({
+                    "day_offset": -i,
+                    "date": target_date.strftime('%d/%m'),
+                    "score": analytics['escalation_score'],
+                    "top_stories": analytics['top_clusters']
+                })
+                
+                step_counter += 1
+                prog_bar.progress(step_counter / total_steps)
+                if not is_cached: time.sleep(0.5)
+            return timeline_data
 
-        # --- לולאת ההווה ---
-        with col_curr:
-            st.subheader(f"🔴 דצמבר 2025 (המצב כרגע)")
-            prog2 = st.progress(0)
-            status2 = st.empty()
+        col1, col2 = st.columns(2)
+        with col1: past_timeline = scan_timeline(attack_date, "Reference")
+        with col2: curr_timeline = scan_timeline(today_date, "Current")
             
-            for i in range(scan_window, -1, -1):
-                curr_date = today_date - datetime.timedelta(days=i)
-                status2.text(f"סורק: {curr_date.strftime('%d/%m/%Y')}...")
-                prog2.progress((scan_window - i) / (scan_window + 1))
-                
-                res = analyze_single_day(client, curr_date, keywords, loop_model)
-                res['date'] = curr_date.strftime('%d/%m')
-                res['day_index'] = -(scan_window - i)
-                curr_data.append(res)
-                
-                render_day_card(res)
-                
-            st.success("סריקת הווה הושלמה")
-
-        # --- גרף השוואתי ---
+        status_text.empty()
+        
+        # --- ויזואליזציה ---
         st.divider()
-        st.header("📈 גרף הלימה (Correlation Graph)")
+        st.subheader("📈 השוואת מדד חריגות (Escalation Index)")
         
         fig = go.Figure()
         fig.add_trace(go.Scatter(
-            x=[d['day_index'] for d in past_data], y=[d['score'] for d in past_data],
-            mode='lines+markers', name='יוני 2025 (עבר)', line=dict(color='#ff4444', width=3)
+            x=[x['day_offset'] for x in past_timeline], y=[x['score'] for x in past_timeline],
+            name="Reference (Past)", line=dict(color='#ef5350', width=3, dash='dot')
         ))
         fig.add_trace(go.Scatter(
-            x=[d['day_index'] for d in curr_data], y=[d['score'] for d in curr_data],
-            mode='lines+markers', name='דצמבר 2025 (הווה)', line=dict(color='#33b5e5', width=3)
+            x=[x['day_offset'] for x in curr_timeline], y=[x['score'] for x in curr_timeline],
+            name="Live (Current)", line=dict(color='#4285f4', width=4)
         ))
-        fig.add_hline(y=alert_threshold, line_dash="dash", line_color="orange")
         st.plotly_chart(fig, use_container_width=True)
         
-        # --- סיכום Gemini 3 Pro ---
+        # --- סיכום מנהלים (Gemini 3 Pro) ---
         st.divider()
-        st.header(f"🧠 מוח על ({reasoning_model})")
+        st.subheader("🧠 סיכום אנליסט (Gemini 3 Pro)")
         
-        with st.spinner("Gemini 3 Pro מחשב את ההסתברות למלחמה..."):
-            # הכנת נתונים מצומצמים לניתוח כדי לא לחרוג מ-Token Limit
-            min_past = [{'day': d['day_index'], 'score': d['score'], 'event': d['key_event']} for d in past_data]
-            min_curr = [{'day': d['day_index'], 'score': d['score'], 'event': d['key_event']} for d in curr_data]
+        past_vec = np.array([x['score'] for x in past_timeline])
+        curr_vec = np.array([x['score'] for x in curr_timeline])
+        correlation = np.corrcoef(past_vec, curr_vec)[0, 1] if np.std(past_vec) > 0 and np.std(curr_vec) > 0 else 0
+        
+        with st.spinner("Gemini 3 Pro מבצע הערכת מצב..."):
+            summary_prompt = f"""
+            Act as a Senior Intelligence Officer.
             
-            prompt = f"""
-            Role: Chief Intelligence Officer.
-            Task: Compare two timelines to predict war.
+            DATASET A (Past Conflict): Correlation: {correlation:.2f}. Scores: {[x['score'] for x in past_timeline]}
+            DATASET B (Current): Scores: {[x['score'] for x in curr_timeline]}
             
-            Timeline A (The buildup to the June 2025 Attack):
-            {json.dumps(min_past, ensure_ascii=False)}
+            Key Themes Past: {[x['top_stories'][0]['main_title'] for x in past_timeline if x['top_stories']]}
+            Key Themes Current: {[x['top_stories'][0]['main_title'] for x in curr_timeline if x['top_stories']]}
             
-            Timeline B (The Current Situation - Dec 2025):
-            {json.dumps(min_curr, ensure_ascii=False)}
+            TASK:
+            1. Analyze mathematical similarity. Is the current slope steeper?
+            2. Compare Themes. Are we seeing similar military indicators?
+            3. Verdict: Is the anomaly resembling the pre-attack indicators?
             
-            Question:
-            Does Timeline B mathematically and thematically match the slope of Timeline A?
-            
-            Output (Hebrew):
-            1. **Match Score:** (0-100% similarity).
-            2. **Analysis:** Compare the daily escalation pace.
-            3. **Verdict:** Are we X days away from an attack like in June?
+            Output in Hebrew.
             """
             
-            resp = client.models.generate_content(
-                model=reasoning_model, # שימוש במודל הפרו החזק
-                contents=prompt,
+            # שימוש במודל Gemini 3 Pro Preview לסיכום
+            response = client.models.generate_content(
+                model="gemini-3-pro-preview",
+                contents=summary_prompt,
                 config=types.GenerateContentConfig(temperature=0.2)
             )
-            st.markdown(resp.text)
+            
+            st.markdown(response.text)
