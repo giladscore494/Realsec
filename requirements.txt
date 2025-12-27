@@ -1,4 +1,6 @@
 streamlit
 google-genai
 pandas
+numpy
 plotly
+scikit-learn
