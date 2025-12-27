@@ -7,13 +7,14 @@ import json
 import sqlite3
 import hashlib
 import plotly.graph_objects as go
+from urllib.parse import urlparse
 from google import genai
 from google.genai import types
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 
 # --- הגדרת עמוד ---
-st.set_page_config(layout="wide", page_title="OSINT Sentinel: Gemini 3")
+st.set_page_config(layout="wide", page_title="OSINT Sentinel: Grounded")
 
 # --- עיצוב CSS ---
 st.markdown("""
@@ -31,14 +32,17 @@ st.markdown("""
         background-color: #ffffff; padding: 8px; border-radius: 4px;
         box-shadow: 0 1px 3px rgba(0,0,0,0.1);
     }
+    .risk-badge {
+        padding: 3px 8px; border-radius: 4px; font-size: 0.8em; font-weight: bold; color: white;
+    }
 </style>
 """, unsafe_allow_html=True)
 
-st.title("🛡️ OSINT Sentinel: מנוע Gemini 3")
-st.caption("מערכת התרעה דטרמיניסטית המופעלת על ידי Gemini 3 Flash & Pro")
+st.title("🛡️ OSINT Sentinel: מנוע מאומת (Grounded)")
+st.caption("מערכת התרעה דטרמיניסטית עם אימות מקורות קשיח (Fail-Closed)")
 
 # --- 1. ניהול Cache (SQLite) ---
-DB_FILE = "osint_cache_v3.db"
+DB_FILE = "osint_cache_v4_grounded.db"
 
 def init_db():
     conn = sqlite3.connect(DB_FILE)
@@ -67,7 +71,34 @@ def save_to_cache(date_str, query_hash, data):
 
 init_db()
 
-# --- 2. הגדרות צד ---
+# --- 2. עזרים: חילוץ Grounding ודומיינים ---
+def _extract_grounded_urls(response) -> set:
+    """מחלץ את ה-URLs האמיתיים שגוגל החזיר ב-Grounding Metadata"""
+    urls = set()
+    try:
+        if not response.candidates: return urls
+        gm = response.candidates[0].grounding_metadata
+        if not gm: return urls
+        
+        chunks = getattr(gm, "grounding_chunks", [])
+        for ch in chunks:
+            if hasattr(ch, "web") and ch.web:
+                uri = ch.web.uri
+                if uri and uri.startswith("http"):
+                    urls.add(uri)
+    except Exception:
+        pass
+    return urls
+
+def _get_domain(url: str) -> str:
+    """מחלץ דומיין נקי (בלי www)"""
+    try:
+        d = urlparse(url).netloc.lower()
+        return d[4:] if d.startswith("www.") else d
+    except:
+        return ""
+
+# --- 3. הגדרות צד ---
 with st.sidebar:
     st.header("⚙️ הגדרות סנסור")
     api_key = st.secrets.get("GOOGLE_API_KEY") or st.text_input("Google API Key", type="password")
@@ -80,15 +111,15 @@ with st.sidebar:
     
     st.divider()
     st.subheader("🎛️ מודלים ופרמטרים")
-    st.info("Scanner: Gemini 3 Flash Preview")
-    st.info("Analyst: Gemini 3 Pro Preview")
+    st.info("Scanner: Gemini 3 Flash (Grounded)")
+    st.info("Analyst: Gemini 3 Pro (Inference)")
     
-    tier1_domains = st.text_area("מקורות איכות (Tier 1):", 
-                                 "reuters.com, apnews.com, bbc.com, ynet.co.il, haaretz.co.il, isna.ir, tasnimnews.com",
-                                 height=70)
+    tier1_domains = st.text_area("מקורות איכות (Tier 1 Domains):", 
+                                 "reuters.com, apnews.com, bbc.com, ynet.co.il, haaretz.co.il, isna.ir, tasnimnews.com, jpost.com, timesofisrael.com",
+                                 height=100)
     keywords = st.text_input("מילות חיפוש:", "Iran Israel military conflict missile attack nuclear")
 
-# --- 3. מנוע איסוף (Gemini 3 Flash) ---
+# --- 4. מנוע איסוף (Fail-Closed) ---
 def fetch_day_data(client, date_obj, keywords):
     date_str = date_obj.strftime('%Y-%m-%d')
     query_hash = hashlib.md5((date_str + keywords).encode()).hexdigest()
@@ -96,107 +127,138 @@ def fetch_day_data(client, date_obj, keywords):
     cached = get_from_cache(date_str, query_hash)
     if cached: return cached, True
 
-    # שאילתת תאריך קשיחה
-    search_query = f"{keywords} after:{date_obj - datetime.timedelta(days=1)} before:{date_obj + datetime.timedelta(days=1)}"
+    # נעילת תאריך קשיחה (24 שעות)
+    after = date_obj
+    before = date_obj + datetime.timedelta(days=1)
+    search_query = f"{keywords} after:{after} before:{before}"
     
     prompt = f"""
     ROLE: OSINT Data Extractor.
-    TASK: Use Google Search to find specific news items for DATE: {date_str}.
+    TASK: Find specific news items for DATE: {date_str}.
     QUERY: "{search_query}"
     
-    INSTRUCTIONS:
-    1. Retrieve a list of distinct news items / reports from that specific day.
-    2. Ignore generic opinion pieces; focus on factual events.
-    3. Return ONLY a JSON object with this schema:
+    MANDATORY: Return a JSON object with a list of news items found.
+    Each item must have: title, source, url, snippet.
+    Use the provided Google Search tool.
     
+    JSON Schema:
     {{
       "items": [
-        {{
-          "title": "Headline",
-          "source": "Publisher Name",
-          "url": "Link",
-          "snippet": "Short summary",
-          "published_date": "YYYY-MM-DD"
-        }}
+        {{ "title": "...", "source": "...", "url": "...", "snippet": "..." }}
       ]
     }}
     """
     
     try:
-        # שימוש במודל Gemini 3 Flash Preview לאיסוף מהיר
+        # שימוש ב-Tool הרשמי החדש
+        google_search_tool = types.Tool(google_search=types.GoogleSearch())
+        
         response = client.models.generate_content(
             model="gemini-3-flash-preview", 
             contents=prompt,
             config=types.GenerateContentConfig(
                 temperature=0.0,
                 response_mime_type="application/json",
-                tools=[{'google_search': {}}]
+                tools=[google_search_tool]
             )
         )
         
-        data = json.loads(response.text)
-        save_to_cache(date_str, query_hash, data)
-        return data, False
+        # 1. חילוץ ה-Grounding האמיתי
+        grounded_urls = _extract_grounded_urls(response)
         
+        # Fail-Closed: אם אין מקורות מאומתים - אין דאטה
+        if not grounded_urls:
+            empty_data = {"items": [], "error": "NO_GROUNDING_SOURCES"}
+            save_to_cache(date_str, query_hash, empty_data)
+            return empty_data, False
+            
+        # 2. סינון ה-JSON לפי המקורות
+        try:
+            raw_data = json.loads(response.text)
+            validated_items = []
+            
+            for item in raw_data.get("items", []):
+                item_url = item.get("url")
+                # הוספנו פריט רק אם ה-URL שלו מופיע ברשימת ה-Grounding
+                if item_url and item_url in grounded_urls:
+                    validated_items.append(item)
+            
+            final_data = {"items": validated_items}
+            save_to_cache(date_str, query_hash, final_data)
+            return final_data, False
+            
+        except json.JSONDecodeError:
+            return {"items": [], "error": "JSON_DECODE_ERROR"}, False
+            
     except Exception as e:
         return {"items": [], "error": str(e)}, False
 
-# --- 4. מנוע אנליטי (Python Deterministic) ---
+# --- 5. מנוע אנליטי (Deterministic) ---
 def analyze_data_points(items, tier1_list):
-    """חישוב מדדים מתמטי ללא AI"""
+    """חישוב מדדים מתמטי ללא AI עם Clustering משופר"""
     if not items:
         return {"volume": 0, "clusters": 0, "tier1_ratio": 0, "escalation_score": 0, "top_clusters": []}
     
     df = pd.DataFrame(items)
-    df['text'] = df['title'] + " " + df['snippet'].fillna("")
+    df["title"] = df["title"].fillna("").astype(str)
+    df["snippet"] = df["snippet"].fillna("").astype(str)
+    df["url"] = df["url"].fillna("").astype(str)
     
-    # Clustering (Deduplication)
-    if len(df) > 1:
-        vectorizer = TfidfVectorizer(stop_words='english')
-        tfidf_matrix = vectorizer.fit_transform(df['text'])
-        cosine_sim = cosine_similarity(tfidf_matrix)
+    # הוספת דומיין וטקסט מלא
+    df["domain"] = df["url"].apply(_get_domain)
+    df["text"] = (df["title"] + " " + df["snippet"]).str.strip()
+    
+    # 1. Clustering אגנוסטי (Char N-grams)
+    if len(df) > 1 and df["text"].str.len().sum() > 0:
+        # שימוש ב-Character N-grams (3-5 תווים) עובד מעולה לשפות שמיות
+        vectorizer = TfidfVectorizer(analyzer="char_wb", ngram_range=(3, 5), min_df=1)
+        tfidf = vectorizer.fit_transform(df["text"])
+        sim = cosine_similarity(tfidf)
         
         clusters = []
         visited = set()
         
         for i in range(len(df)):
             if i in visited: continue
-            cluster_indices = [i]
+            idxs = [i]
             visited.add(i)
+            
             for j in range(i+1, len(df)):
                 if j in visited: continue
-                if cosine_sim[i][j] > 0.6: # סף דמיון
-                    cluster_indices.append(j)
+                if sim[i][j] > 0.55: # סף דמיון
+                    idxs.append(j)
                     visited.add(j)
             
-            cluster_items = df.iloc[cluster_indices]
+            part = df.iloc[idxs]
             clusters.append({
-                "main_title": cluster_items.iloc[0]['title'],
-                "count": len(cluster_items),
-                "sources": cluster_items['source'].unique().tolist()
+                "main_title": part.iloc[0]["title"],
+                "count": len(part),
+                "domains": sorted(set(part["domain"].tolist()))
             })
     else:
-        clusters = [{"main_title": df.iloc[0]['title'], "count": 1, "sources": [df.iloc[0]['source']]}]
+        clusters = [{"main_title": df.iloc[0]["title"], "count": 1, "domains": [df.iloc[0]["domain"]]}]
 
-    # חישוב ציון דטרמיניסטי
+    # 2. חישוב Tier 1 לפי דומיין
+    tier1_set = {x.strip().lower().replace("www.", "") for x in tier1_list.split(",") if x.strip()}
+    tier1_ratio = float(df["domain"].isin(tier1_set).mean()) if len(df) else 0.0
+
+    # 3. חישוב ציון דטרמיניסטי
     unique_stories = len(clusters)
-    tier1_sources = [s.strip().lower() for s in tier1_list.split(',')]
-    tier1_count = df['source'].astype(str).apply(lambda x: any(t in x.lower() for t in tier1_sources)).sum()
-    tier1_ratio = round(tier1_count / len(df), 2) if len(df) > 0 else 0
-    avg_sources = len(df) / unique_stories if unique_stories > 0 else 0
+    avg_sources = (len(df) / unique_stories) if unique_stories else 0
     
-    # הנוסחה המתמטית
+    # הנוסחה: נפח ייחודי + בונוס איכות + בונוס עקביות
     score = (unique_stories * 4) + (tier1_ratio * 30) + (avg_sources * 5)
     
     return {
-        "volume": len(df),
-        "clusters": unique_stories,
-        "escalation_score": min(score, 100),
-        "top_clusters": sorted(clusters, key=lambda x: x['count'], reverse=True)[:3]
+        "volume": int(len(df)),
+        "clusters": int(unique_stories),
+        "tier1_ratio": round(tier1_ratio, 2),
+        "escalation_score": float(min(score, 100)),
+        "top_clusters": sorted(clusters, key=lambda x: x["count"], reverse=True)[:3]
     }
 
-# --- 5. לוגיקה ראשית ---
-if st.button("🚀 הפעל ניתוח (Gemini 3 Engine)", type="primary"):
+# --- 6. לוגיקה ראשית ---
+if st.button("🚀 הפעל ניתוח מאומת (Run Grounded Scan)", type="primary"):
     if not api_key:
         st.error("חסר מפתח API")
     else:
@@ -231,53 +293,53 @@ if st.button("🚀 הפעל ניתוח (Gemini 3 Engine)", type="primary"):
             return timeline_data
 
         col1, col2 = st.columns(2)
-        with col1: past_timeline = scan_timeline(attack_date, "Reference")
-        with col2: curr_timeline = scan_timeline(today_date, "Current")
+        with col1: past_timeline = scan_timeline(attack_date, "Reference (Past)")
+        with col2: curr_timeline = scan_timeline(today_date, "Live (Current)")
             
         status_text.empty()
         
         # --- ויזואליזציה ---
         st.divider()
-        st.subheader("📈 השוואת מדד חריגות (Escalation Index)")
+        st.subheader("📈 מדד חריגות (Verified Sources Only)")
         
         fig = go.Figure()
         fig.add_trace(go.Scatter(
             x=[x['day_offset'] for x in past_timeline], y=[x['score'] for x in past_timeline],
-            name="Reference (Past)", line=dict(color='#ef5350', width=3, dash='dot')
+            name="Reference", line=dict(color='#ef5350', width=3, dash='dot')
         ))
         fig.add_trace(go.Scatter(
             x=[x['day_offset'] for x in curr_timeline], y=[x['score'] for x in curr_timeline],
-            name="Live (Current)", line=dict(color='#4285f4', width=4)
+            name="Current", line=dict(color='#4285f4', width=4)
         ))
         st.plotly_chart(fig, use_container_width=True)
         
-        # --- סיכום מנהלים (Gemini 3 Pro) ---
+        # --- סיכום מנהלים (Gemini 3 Pro - No Prediction) ---
         st.divider()
-        st.subheader("🧠 סיכום אנליסט (Gemini 3 Pro)")
+        st.subheader("🧠 הערכת מצב (Gemini 3 Pro)")
         
         past_vec = np.array([x['score'] for x in past_timeline])
         curr_vec = np.array([x['score'] for x in curr_timeline])
         correlation = np.corrcoef(past_vec, curr_vec)[0, 1] if np.std(past_vec) > 0 and np.std(curr_vec) > 0 else 0
         
-        with st.spinner("Gemini 3 Pro מבצע הערכת מצב..."):
+        with st.spinner("Gemini 3 Pro מנתח חריגות..."):
             summary_prompt = f"""
             Act as a Senior Intelligence Officer.
             
-            DATASET A (Past Conflict): Correlation: {correlation:.2f}. Scores: {[x['score'] for x in past_timeline]}
-            DATASET B (Current): Scores: {[x['score'] for x in curr_timeline]}
+            DATASET A (Reference Period): Correlation: {correlation:.2f}. Scores: {[x['score'] for x in past_timeline]}
+            DATASET B (Current Period): Scores: {[x['score'] for x in curr_timeline]}
             
             Key Themes Past: {[x['top_stories'][0]['main_title'] for x in past_timeline if x['top_stories']]}
             Key Themes Current: {[x['top_stories'][0]['main_title'] for x in curr_timeline if x['top_stories']]}
             
             TASK:
-            1. Analyze mathematical similarity. Is the current slope steeper?
-            2. Compare Themes. Are we seeing similar military indicators?
-            3. Verdict: Is the anomaly resembling the pre-attack indicators?
+            1. Analyze Anomaly Level: Is the current activity structurally similar to the reference period?
+            2. Identify Drivers: What are the main clusters driving the score today?
+            3. Certainty Assessment: Based on cluster density and Tier 1 sources coverage.
             
+            DO NOT predict attacks or give dates. Focus on structural similarity of the signals.
             Output in Hebrew.
             """
             
-            # שימוש במודל Gemini 3 Pro Preview לסיכום
             response = client.models.generate_content(
                 model="gemini-3-pro-preview",
                 contents=summary_prompt,
