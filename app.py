@@ -15,7 +15,7 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 
 # --- הגדרת עמוד ---
-st.set_page_config(layout="wide", page_title="OSINT Sentinel: Gold v1.1")
+st.set_page_config(layout="wide", page_title="OSINT Sentinel: Gold v1.3")
 
 # --- עיצוב CSS ---
 st.markdown("""
@@ -36,17 +36,22 @@ st.markdown("""
         font-size: 0.85em; display: block; margin-bottom: 3px;
         text-decoration: none; color: #0066cc;
     }
+    .evidence-link:hover { text-decoration: underline; }
     .metric-warning { color: #d9534f; font-weight: bold; font-size: 0.8em; }
-    .status-ok { color: #00c851; font-weight: bold; }
-    .status-err { color: #ff4444; font-weight: bold; }
+    
+    /* דיבאג מתוקן */
+    .debug-info {
+        font-size: 0.75em; color: #666; margin-top: 6px;
+        border-top: 1px dashed #ccc; padding-top: 4px;
+    }
 </style>
 """, unsafe_allow_html=True)
 
-st.title("🛡️ OSINT Sentinel: Gold v1.1")
-st.caption("מערכת I&W סופית: אימות חכם (Vertex/Redirects), State Management וראיות נקיות")
+st.title("🛡️ OSINT Sentinel: Gold v1.3")
+st.caption("I&W System: Production Ready (Fixes Applied)")
 
 # --- 1. ניהול Cache (SQLite) ---
-DB_FILE = "osint_gold_v1_1.db" # גרסה חדשה ל-DB
+DB_FILE = "osint_gold_v1_3.db"
 
 def init_db():
     conn = sqlite3.connect(DB_FILE)
@@ -94,7 +99,6 @@ def _get_domain(url: str) -> str:
 def _is_aggregator_domain(d: str) -> bool:
     if not d: return False
     d = d.lower().replace("www.", "")
-    # בדיקת התאמה מלאה או סיומת (כדי לתפוס news.google.com וכו')
     return any(d == s or d.endswith("." + s) for s in AGGREGATOR_SUFFIXES)
 
 def _normalize_url(u: str) -> str:
@@ -104,7 +108,6 @@ def _normalize_url(u: str) -> str:
         netloc = p.netloc.lower()
         if netloc.startswith("www."): netloc = netloc[4:]
         path = p.path.rstrip("/")
-        # ניקוי פרמטרים
         DROP_KEYS = {"fbclid", "gclid", "ref", "ref_src", "utm_source", "utm_medium", "utm_campaign", "ocid"}
         q = [(k, v) for k, v in parse_qsl(p.query, keep_blank_values=True)
              if k.lower() not in DROP_KEYS and not k.lower().startswith("utm_")]
@@ -114,7 +117,6 @@ def _normalize_url(u: str) -> str:
         return u or ""
 
 def _extract_grounded_urls(response) -> tuple[set, set]:
-    """חילוץ חכם כולל Title Fallback"""
     urls_norm = set()
     domains = set()
     try:
@@ -130,18 +132,14 @@ def _extract_grounded_urls(response) -> tuple[set, set]:
             uri = getattr(web, "uri", None)
             title = getattr(web, "title", None)
             
-            # 1. חילוץ מ-URI
             if uri and uri.startswith("http"):
                 urls_norm.add(_normalize_url(uri))
                 d = _get_domain(uri)
                 if d and not _is_aggregator_domain(d):
                     domains.add(d)
             
-            # 2. חילוץ מ-Title (אם נראה כמו דומיין)
-            # לעיתים גוגל מחזיר את הדומיין האמיתי ב-Title כשה-URI הוא Redirect
             if title and "." in title and " " not in title:
                 d2 = title.lower().replace("www.", "")
-                # ולידציה בסיסית שזה דומיין
                 if len(d2) > 3 and not _is_aggregator_domain(d2):
                     domains.add(d2)
                     
@@ -178,10 +176,10 @@ with st.sidebar:
                                  height=100)
     keywords = st.text_input("מילות חיפוש:", "Iran Israel military conflict missile attack nuclear")
 
-# --- 4. מנוע איסוף (Updated Logic) ---
+# --- 4. מנוע איסוף ---
 def fetch_day_data(client, date_obj, keywords, mode="Relaxed"):
     date_str = date_obj.strftime('%Y-%m-%d')
-    query_hash = hashlib.md5((date_str + keywords + mode + "v1.1").encode()).hexdigest()
+    query_hash = hashlib.md5((date_str + keywords + mode + "v1.3").encode()).hexdigest()
     
     cached = get_from_cache(date_str, query_hash)
     if cached: return cached, True
@@ -230,13 +228,11 @@ def fetch_day_data(client, date_obj, keywords, mode="Relaxed"):
             except:
                 raw_items = []
 
-            # ולידציה: אם יש גראונדינג אבל אין פריטים ב-JSON - משהו השתבש
             if (grounded_norm or grounded_domains) and not raw_items:
                 err_data = {"items": [], "error": "EMPTY_ITEMS_WITH_GROUNDING", "debug": {"attempts": attempt+1}}
                 save_to_cache(date_str, query_hash, err_data)
                 return err_data, False
             
-            # ולידציה: אם אין בכלל גראונדינג
             if not grounded_norm and not grounded_domains:
                 empty_data = {"items": [], "error": "NO_GROUNDING_SOURCES", "debug": {"attempts": attempt+1}}
                 save_to_cache(date_str, query_hash, empty_data)
@@ -251,7 +247,6 @@ def fetch_day_data(client, date_obj, keywords, mode="Relaxed"):
                 u_norm = _normalize_url(u)
                 u_domain = _get_domain(u)
                 
-                # סינון אגרגטורים חכם (כולל Vertex/Cloud)
                 if _is_aggregator_domain(u_domain): continue
                 
                 is_valid = False
@@ -264,7 +259,6 @@ def fetch_day_data(client, date_obj, keywords, mode="Relaxed"):
                 "items": validated_items,
                 "debug": {
                     "fetched": len(raw_items),
-                    "grounded": len(grounded_norm),
                     "grounded_domains": len(grounded_domains),
                     "valid": len(validated_items),
                     "attempt": attempt + 1
@@ -278,20 +272,25 @@ def fetch_day_data(client, date_obj, keywords, mode="Relaxed"):
                 return {"items": [], "error": str(e), "debug": {"attempts": 3}}, False
             time.sleep(1 + attempt)
 
-# --- 5. מנוע אנליטי (Evidence Normalized) ---
+# --- 5. מנוע אנליטי ---
 def analyze_data_points(items, tier1_list):
     if not items:
         return {"volume": 0, "clusters": 0, "tier1_ratio": 0, "escalation_score": 0, "confidence": 0, "top_clusters": [], "evidence": []}
     
     df = pd.DataFrame(items)
+    
+    # Sanitization
+    for col in ["title", "snippet", "url"]:
+        if col not in df.columns: df[col] = ""
+        df[col] = df[col].fillna("").astype(str)
+        
     df["domain"] = df["url"].apply(_get_domain)
-    # ניקוי אגרגטורים נוסף ליתר ביטחון (למקרה שזלג)
     df = df[~df["domain"].apply(_is_aggregator_domain)]
     
     if df.empty:
          return {"volume": 0, "clusters": 0, "tier1_ratio": 0, "escalation_score": 0, "confidence": 0, "top_clusters": [], "evidence": []}
 
-    df["text"] = (df["title"] + " " + df["snippet"].fillna("")).str.strip()
+    df["text"] = (df["title"] + " " + df["snippet"]).str.strip()
     
     # Clustering
     clusters = []
@@ -334,7 +333,6 @@ def analyze_data_points(items, tier1_list):
     tier1_bonus = min(10, tier1_unique_count * 2)
     score = (unique_stories * 4) + (tier1_ratio * 30) + (avg_sources * 5) + tier1_bonus
     
-    # Confidence
     conf_clusters = min(1.0, unique_stories / 5)
     conf_vol = min(1.0, len(unique_domains_today) / 6)
     confidence = (0.35 * conf_clusters) + (0.45 * tier1_ratio) + (0.20 * conf_vol)
@@ -342,7 +340,7 @@ def analyze_data_points(items, tier1_list):
     if len(unique_domains_today) < 3 or unique_stories < 2:
         confidence = min(confidence, 0.25)
     
-    # Evidence Selection (Normalized)
+    # Evidence Selection
     evidence = []
     top_clusters = sorted(clusters, key=lambda x: x["count"], reverse=True)[:5]
     seen_urls_norm = set()
@@ -377,7 +375,7 @@ def analyze_data_points(items, tier1_list):
         "evidence": evidence
     }
 
-# --- 6. ניהול State ו-UI ראשי ---
+# --- 6. ניהול State ו-UI ---
 if 'past_timeline' not in st.session_state: st.session_state.past_timeline = None
 if 'curr_timeline' not in st.session_state: st.session_state.curr_timeline = None
 if 'summary_text' not in st.session_state: st.session_state.summary_text = None
@@ -425,10 +423,15 @@ def run_scan():
     status_text.empty()
     prog_bar.empty()
     
-    # ביצוע הסיכום בסוף (פעם אחת)
+    # ביצוע סיכום
     past_scores = [x['score'] for x in st.session_state.past_timeline]
     curr_scores = [x['score'] for x in st.session_state.curr_timeline]
-    correlation = np.corrcoef(past_scores, curr_scores)[0, 1] if (len(past_scores)>1 and np.std(past_scores)>0 and np.std(curr_scores)>0) else 0
+    
+    correlation = 0
+    if len(past_scores) > 1 and len(curr_scores) > 1:
+         if np.std(past_scores) > 0 and np.std(curr_scores) > 0:
+             correlation = np.corrcoef(past_scores, curr_scores)[0, 1]
+             
     avg_conf = np.mean([x['confidence'] for x in st.session_state.curr_timeline])
     
     with st.spinner("Gemini 3 Pro מנתח..."):
@@ -452,7 +455,7 @@ def run_scan():
 if st.button("🚀 הפעל ניתוח מבצעי (Run)", type="primary"):
     run_scan()
 
-# --- 7. רינדור התוצאות מה-State ---
+# --- 7. רינדור ---
 if st.session_state.past_timeline and st.session_state.curr_timeline:
     
     past = st.session_state.past_timeline
@@ -472,32 +475,46 @@ if st.session_state.past_timeline and st.session_state.curr_timeline:
     fig.update_yaxes(title_text="Conf", range=[0,1], secondary_y=True)
     st.plotly_chart(fig, use_container_width=True)
     
-    # חקר נתונים
+    # חקר נתונים (החלק המתוקן)
     st.divider()
     st.subheader("🔍 חקר ראיות (Evidence Locker)")
     c1, c2 = st.columns(2)
     
     def render_timeline(tl):
         for day in tl:
-            conf_icon = "🟢" if day['confidence'] > 0.6 else "🟠" if day['confidence'] > 0.3 else "🔴"
-            err_mark = "⚠️" if day.get('error') else ""
+            conf_icon = "🟢" if day.get("confidence", 0) > 0.6 else "🟠" if day.get("confidence", 0) > 0.3 else "🔴"
+            err_mark = "⚠️" if day.get("error") else ""
             
-            with st.expander(f"{day['date']} | Score: {day['score']:.0f} | Conf: {day['confidence']} {conf_icon} {err_mark}"):
-                if day.get('error'): st.error(day['error'])
+            with st.expander(
+                f"{day.get('date','')} | Score: {day.get('score',0):.0f} | Conf: {day.get('confidence',0)} {conf_icon} {err_mark}"
+            ):
+                if day.get("error"):
+                    st.error(day["error"])
                 
-                # ראיות
-                if day['evidence']:
+                evidence = day.get("evidence", [])
+                if evidence:
                     st.markdown("**🔗 ראיות נבחרות:**")
-                    for ev in day['evidence']:
-                        t1_mark = "⭐" if ev['tier1'] else ""
-                        st.markdown(f"<a href='{ev['url']}' target='_blank' class='evidence-link'>{t1_mark} {ev['title']} <span style='color:#777'>({ev['domain']})</span></a>", unsafe_allow_html=True)
+                    for ev in evidence:
+                        t1_mark = "⭐" if ev.get("tier1") else ""
+                        st.markdown(
+                            f"<a href='{ev.get('url','')}' target='_blank' class='evidence-link'>"
+                            f"{t1_mark} {ev.get('title','')} <span style='color:#777'>({ev.get('domain','')})</span>"
+                            f"</a>",
+                            unsafe_allow_html=True
+                        )
                 else:
                     st.caption("אין ראיות מאומתות.")
                 
-                # דיבאג
-                dbg = day.get('debug', {})
+                dbg = day.get("debug", {}) or {}
                 if dbg:
-                    st.markdown(f"<div class='debug-info'>Fetched: {dbg.get('fetched')} | Domains: {dbg.get('grounded_domains')} | Valid: {dbg.get('valid')}</div>", unsafe_allow_html=True)
+                    st.markdown(
+                        f"<div class='debug-info'>"
+                        f"Fetched: {dbg.get('fetched',0)} | "
+                        f"Domains: {dbg.get('grounded_domains',0)} | "
+                        f"Valid: {dbg.get('valid',0)}"
+                        f"</div>",
+                        unsafe_allow_html=True
+                    )
 
     with c1: 
         st.markdown("### Reference")
@@ -506,10 +523,11 @@ if st.session_state.past_timeline and st.session_state.curr_timeline:
         st.markdown("### Live")
         render_timeline(curr)
         
-    # סיכום
+    # סיכום מנהלים
+    st.divider()
+    st.subheader("🧠 הערכת מצב (Gemini 3 Pro)")
     if st.session_state.summary_text:
-        st.divider()
-        st.subheader("🧠 הערכת מצב")
         st.markdown(st.session_state.summary_text)
-
+    else:
+        st.caption("אין סיכום עדיין. לחץ Run.")
 
