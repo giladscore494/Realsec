@@ -5,3 +5,4 @@ plotly
 google-genai
 scikit-learn
 openpyxl
+requests
