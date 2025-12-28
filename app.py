@@ -1,11 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-🛡️ OSINT Sentinel: Platinum v1.5.1 (Fixed)
-- Smart Strict validation (prevents "validated=0" flatline)
-- Global rate limiter + Gemini client pool (thread-safe)
-- Robust JSON export (no "not JSON serializable" TypeError)
-- Evidence locker + Trends + Anomalies (z-score)
-- SQLite WAL + daily cache + audit log
+🛡️ OSINT Sentinel: Platinum v1.6.0 (X API + Gemini Flash + (Optional) Grok/x.ai Summary)
+- Stage 1: X API (daily collection)
+- Stage 2: Gemini Flash (Google Search tool) (daily collection)
+- Stage 3 (optional): Grok/x.ai chat completions for daily summarization (NO forecasting)
+- Then: math/analytics (clusters, weights, trend, z-score)
 """
 
 import re
@@ -25,6 +24,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Set, Tuple
 from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse
 
+import requests
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -50,9 +50,9 @@ logger = logging.getLogger("osint_platinum")
 # =========================
 @dataclass(frozen=True)
 class Config:
-    APP_TITLE: str = "🛡️ OSINT Sentinel: Platinum v1.5.1"
-    VERSION_TAG: str = "v1.5.1"
-    DB_FILE: str = "osint_plat_v1_5.db"
+    APP_TITLE: str = "🛡️ OSINT Sentinel: Platinum v1.6.0"
+    VERSION_TAG: str = "v1.6.0"
+    DB_FILE: str = "osint_plat_v1_6.db"
 
     # Concurrency & retries
     MAX_WORKERS: int = 3
@@ -63,8 +63,25 @@ class Config:
     PRO_MODEL: str = "gemini-3-pro-preview"
 
     # Rate limiting (global across threads)
-    MIN_INTERVAL_SEC: float = 0.55  # min spacing between calls
+    MIN_INTERVAL_SEC: float = 0.55
     JITTER_SEC: float = 0.25
+
+    # X API (v2)
+    X_API_BASE: str = "https://api.x.com"
+    X_RECENT_ENDPOINT: str = "/2/tweets/search/recent"
+    X_ALL_ENDPOINT: str = "/2/tweets/search/all"  # needs full-archive access
+    X_RECENT_DAYS_LIMIT: int = 7
+    X_PAGE_SIZE: int = 100
+    X_MAX_PAGES: int = 4
+    X_MAX_ITEMS_PER_DAY: int = 250
+
+    # x.ai (Grok) chat completions
+    XAI_API_BASE: str = "https://api.x.ai"
+    XAI_CHAT_COMPLETIONS_ENDPOINT: str = "/v1/chat/completions"
+    XAI_DEFAULT_MODEL: str = "grok-4"
+    XAI_TIMEOUT_SEC: int = 35
+    XAI_MAX_INPUT_ITEMS: int = 60  # cap items passed to grok
+    XAI_MAX_TEXT_CHARS_PER_ITEM: int = 380
 
     # Noise / propaganda blocks
     BLACKLIST_DOMAINS: Set[str] = frozenset({
@@ -98,7 +115,8 @@ DOMAIN_WEIGHTS = {
     "ynet.co.il": 0.85, "haaretz.co.il": 0.85, "timesofisrael.com": 0.85,
     "jpost.com": 0.80, "maariv.co.il": 0.75, "walla.co.il": 0.75,
     "aljazeera.com": 0.70, "tasnimnews.com": 0.60, "isna.ir": 0.60,
-    "iranintl.com": 0.65
+    "iranintl.com": 0.65,
+    "x.com": 0.45,
 }
 Config.DOMAIN_WEIGHTS = DOMAIN_WEIGHTS
 
@@ -128,10 +146,18 @@ st.markdown("""
         font-size: 0.78em; color: #666; margin-top: 6px;
         border-top: 1px dashed #ccc; padding-top: 4px;
     }
+    .grok-box {
+        background: #f7f7ff;
+        border-right: 3px solid #7c3aed;
+        padding: 10px;
+        border-radius: 8px;
+        font-size: 0.92em;
+        margin-top: 8px;
+    }
 </style>
 """, unsafe_allow_html=True)
 
-# חובה: Disclaimer בתחילת האפליקציה (בדיוק בפורמט המבוקש)
+# חובה: Disclaimer בתחילת האפליקציה
 st.warning("""
 ⚖️ **הצהרת אחריות**
 מערכת זו נועדה למחקר ואנליזה של מידע פומבי בלבד.
@@ -141,7 +167,7 @@ st.warning("""
 
 st.info("המערכת מציגה סטטיסטיקה של שיח תקשורתי (OSINT) ואינה מספקת התרעות, תחזיות תקיפה או ייעוץ אופרטיבי.")
 st.title(Config.APP_TITLE)
-st.caption("Advanced OSINT I&W: Concurrency-safe, Rate-limited, Weighted Evidence + Trends/Anomalies (No forecasting)")
+st.caption("OSINT I&W: X API → Gemini Flash → (Optional) Grok Summary → Weighted Evidence + Trends/Anomalies (No forecasting)")
 
 
 # =========================
@@ -169,10 +195,7 @@ def normalize_url(u: str) -> str:
 
 
 def normalize_url_key(u: str) -> str:
-    """
-    Key for matching: scheme ignored, query dropped.
-    This is more stable than exact URL matching.
-    """
+    """Key for matching: scheme ignored, query dropped."""
     try:
         u_norm = normalize_url(u)
         p = urlparse(u_norm)
@@ -209,41 +232,29 @@ def domain_weight(domain: str) -> float:
 # Robust JSON serialization
 # =========================
 def to_jsonable(obj: Any) -> Any:
-    """
-    Convert common non-JSON types into JSON-safe Python types.
-    Fixes: datetime/date, numpy scalars/arrays, sets, tuples, bytes, pandas types.
-    """
     if obj is None:
         return None
-
     if isinstance(obj, (str, int, float, bool)):
         return obj
-
     if isinstance(obj, (datetime.datetime, datetime.date)):
         return obj.isoformat()
-
     if isinstance(obj, (np.integer,)):
         return int(obj)
     if isinstance(obj, (np.floating,)):
         return float(obj)
     if isinstance(obj, (np.ndarray,)):
         return obj.tolist()
-
     if isinstance(obj, (pd.Timestamp,)):
         return obj.isoformat()
-
     if isinstance(obj, (bytes, bytearray)):
         try:
             return obj.decode("utf-8", errors="replace")
         except Exception:
             return str(obj)
-
     if isinstance(obj, dict):
         return {str(k): to_jsonable(v) for k, v in obj.items()}
-
     if isinstance(obj, (list, tuple, set)):
         return [to_jsonable(x) for x in list(obj)]
-
     return str(obj)
 
 
@@ -252,17 +263,12 @@ def safe_json_bytes(obj: Any, indent: int = 2) -> bytes:
 
 
 def extract_json_object(text: str) -> Dict[str, Any]:
-    """
-    Gemini sometimes returns JSON with extra whitespace; try strict load first,
-    then substring between first '{' and last '}'.
-    """
     if not text:
         return {}
     try:
         return json.loads(text)
     except Exception:
         pass
-
     m1 = text.find("{")
     m2 = text.rfind("}")
     if 0 <= m1 < m2:
@@ -326,7 +332,7 @@ class SQLitePool:
             conn = sqlite3.connect(self.db_file, check_same_thread=False)
             conn.execute("PRAGMA journal_mode=WAL;")
             conn.execute("PRAGMA synchronous=NORMAL;")
-            conn.execute("PRAGMA busy_timeout=5000;")  # ↓ reduce "database is locked"
+            conn.execute("PRAGMA busy_timeout=5000;")
             self.pool.put(conn)
 
     def get(self) -> sqlite3.Connection:
@@ -375,7 +381,8 @@ class DatabaseManager:
         try:
             conn.execute(
                 "INSERT OR REPLACE INTO daily_scans (scan_date, query_hash, raw_json, updated_at) VALUES (?, ?, ?, ?)",
-                (date_str, query_hash, json.dumps(to_jsonable(data), ensure_ascii=False), datetime.datetime.now().isoformat())
+                (date_str, query_hash, json.dumps(to_jsonable(data), ensure_ascii=False),
+                 datetime.datetime.now().isoformat())
             )
             conn.commit()
         finally:
@@ -498,10 +505,9 @@ JSON SCHEMA:
         mode: str,
     ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
         """
-        Fix for flatline:
-        - Strict: prefer URL-key match (domain+path, no query)
-        - Smart Strict fallback: allow domain-level match ONLY for high-trust domains (weight>=0.80)
-        - Relaxed: allow domain-level match
+        Collect: keep items after basic hygiene (no grounding match needed)
+        Strict: url-key match, with high-trust domain fallback (weight>=0.80)
+        Relaxed: domain-level match
         """
         validated: List[Dict[str, Any]] = []
         dbg = {
@@ -522,7 +528,6 @@ JSON SCHEMA:
 
             u_norm = normalize_url(url)
             d = get_domain(u_norm)
-
             if not d:
                 continue
 
@@ -532,6 +537,11 @@ JSON SCHEMA:
 
             if is_aggregator_domain(d):
                 dbg["dropped_aggregator"] += 1
+                continue
+
+            # Collect mode: no grounding requirement
+            if mode == "Collect":
+                validated.append({"title": title, "source": source, "url": u_norm, "snippet": snippet})
                 continue
 
             u_key = normalize_url_key(u_norm)
@@ -552,12 +562,7 @@ JSON SCHEMA:
                 dbg["dropped_ungrounded"] += 1
                 continue
 
-            validated.append({
-                "title": title,
-                "source": source,
-                "url": u_norm,
-                "snippet": snippet
-            })
+            validated.append({"title": title, "source": source, "url": u_norm, "snippet": snippet})
 
         return validated, dbg
 
@@ -566,7 +571,7 @@ JSON SCHEMA:
         date_str = date_obj.strftime("%Y-%m-%d")
         query_hash = hashlib.md5((date_str + keywords + mode + Config.VERSION_TAG).encode("utf-8")).hexdigest()
 
-        cached = db_manager.get_data(date_str, query_hash)
+        cached = db_manager.get_data(date_str, "WEB_" + query_hash)
         if cached:
             return cached, True
 
@@ -601,7 +606,7 @@ JSON SCHEMA:
             err = None
             if (grounded_keys or grounded_domains) and not raw_items:
                 err = "EMPTY_ITEMS_WITH_GROUNDING"
-            if not grounded_keys and not grounded_domains:
+            if not grounded_keys and not grounded_domains and mode != "Collect":
                 err = "NO_GROUNDING_SOURCES"
 
             out = {
@@ -618,16 +623,260 @@ JSON SCHEMA:
                 "items": validated_items
             }
 
-            db_manager.save_data(date_str, query_hash, out)
+            db_manager.save_data(date_str, "WEB_" + query_hash, out)
             return out, False
 
         except Exception as e:
             logger.exception(f"Fetch failed for {date_str}: {e}")
             out = {"error": str(e), "debug": {"date": date_str, "mode": mode}, "items": []}
-            db_manager.save_data(date_str, query_hash, out)
+            db_manager.save_data(date_str, "WEB_" + query_hash, out)
             return out, False
         finally:
             self.clients.release(client)
+
+
+# =========================
+# X API Scanner (Stage 1)
+# =========================
+class XScanner:
+    def __init__(self, bearer_token: str, rate_limiter: GlobalRateLimiter):
+        self.token = bearer_token
+        self.rate = rate_limiter
+
+    def _iso_utc(self, d: datetime.datetime) -> str:
+        if d.tzinfo is None:
+            d = d.replace(tzinfo=datetime.timezone.utc)
+        return d.astimezone(datetime.timezone.utc).isoformat().replace("+00:00", "Z")
+
+    def _too_old_for_recent(self, day: datetime.date) -> bool:
+        today = datetime.datetime.now(datetime.timezone.utc).date()
+        return (today - day).days > Config.X_RECENT_DAYS_LIMIT
+
+    @retry_with_backoff(retries=Config.MAX_RETRIES, base=1.0)
+    def fetch_day(self, date_obj: datetime.date, x_query: str, use_full_archive: bool) -> Tuple[Dict[str, Any], bool]:
+        date_str = date_obj.strftime("%Y-%m-%d")
+        mode_tag = "ALL" if use_full_archive else "RECENT"
+        query_hash = hashlib.md5((date_str + x_query + mode_tag + Config.VERSION_TAG).encode("utf-8")).hexdigest()
+
+        cached = db_manager.get_data(date_str, "X_" + query_hash)
+        if cached:
+            return cached, True
+
+        if (not use_full_archive) and self._too_old_for_recent(date_obj):
+            out = {
+                "error": f"X_RECENT_LIMIT_{Config.X_RECENT_DAYS_LIMIT}D",
+                "debug": {"date": date_str, "mode": mode_tag, "items": 0},
+                "items": []
+            }
+            db_manager.save_data(date_str, "X_" + query_hash, out)
+            return out, False
+
+        start_dt = datetime.datetime.combine(date_obj, datetime.time.min).replace(tzinfo=datetime.timezone.utc)
+        end_dt = start_dt + datetime.timedelta(days=1)
+
+        endpoint = Config.X_ALL_ENDPOINT if use_full_archive else Config.X_RECENT_ENDPOINT
+        url = Config.X_API_BASE + endpoint
+        headers = {"Authorization": f"Bearer {self.token}"}
+
+        items: List[Dict[str, Any]] = []
+        next_token = None
+        pages = 0
+
+        while pages < Config.X_MAX_PAGES and len(items) < Config.X_MAX_ITEMS_PER_DAY:
+            params = {
+                "query": x_query.strip(),
+                "start_time": self._iso_utc(start_dt),
+                "end_time": self._iso_utc(end_dt),
+                "max_results": Config.X_PAGE_SIZE,
+                "tweet.fields": "created_at,lang,public_metrics,author_id",
+                "expansions": "author_id",
+                "user.fields": "username",
+            }
+            if next_token:
+                params["next_token"] = next_token
+
+            self.rate.acquire()
+            r = requests.get(url, headers=headers, params=params, timeout=25)
+
+            if r.status_code == 429:
+                raise RuntimeError("X_RATE_LIMIT_429")
+            if r.status_code >= 400:
+                raise RuntimeError(f"X_HTTP_{r.status_code}: {r.text[:300]}")
+
+            payload = r.json()
+            data = payload.get("data") or []
+            includes = payload.get("includes") or {}
+            users = includes.get("users") or []
+
+            id_to_username = {}
+            for u in users:
+                uid = str(u.get("id", "") or "")
+                uname = str(u.get("username", "") or "")
+                if uid and uname:
+                    id_to_username[uid] = uname
+
+            for t in data:
+                tid = str(t.get("id", "") or "")
+                text = str(t.get("text", "") or "").strip()
+                author_id = str(t.get("author_id", "") or "")
+                uname = id_to_username.get(author_id, "")
+                created_at = t.get("created_at")
+
+                if not tid or not text:
+                    continue
+
+                if uname:
+                    tweet_url = f"https://x.com/{uname}/status/{tid}"
+                    title = f"@{uname}: {text[:90]}"
+                else:
+                    tweet_url = f"https://x.com/i/web/status/{tid}"
+                    title = text[:90]
+
+                items.append({
+                    "title": title,
+                    "source": "X",
+                    "url": tweet_url,
+                    "snippet": text,
+                    "created_at": created_at,
+                })
+
+                if len(items) >= Config.X_MAX_ITEMS_PER_DAY:
+                    break
+
+            meta = payload.get("meta") or {}
+            next_token = meta.get("next_token")
+            pages += 1
+            if not next_token:
+                break
+
+        out = {
+            "error": None,
+            "debug": {"date": date_str, "mode": mode_tag, "pages": pages, "items": len(items)},
+            "items": items
+        }
+
+        db_manager.save_data(date_str, "X_" + query_hash, out)
+        return out, False
+
+
+# =========================
+# Grok/x.ai Summarizer (Stage 3 - Optional)
+# =========================
+class GrokSummarizer:
+    def __init__(self, api_key: str, rate_limiter: GlobalRateLimiter):
+        self.api_key = api_key
+        self.rate = rate_limiter
+
+    def _items_fingerprint(self, items: List[Dict[str, Any]]) -> str:
+        # stable hash based on normalized urls + titles (capped)
+        parts = []
+        for it in (items or [])[:200]:
+            parts.append(normalize_url(str(it.get("url", "") or "")))
+            parts.append(str(it.get("title", "") or "")[:140])
+        raw = "||".join(parts).encode("utf-8", errors="ignore")
+        return hashlib.sha1(raw).hexdigest()
+
+    def _build_prompt(self, date_str: str, items: List[Dict[str, Any]]) -> str:
+        # IMPORTANT: NO forecasting, NO operational guidance. Summary only.
+        trimmed = []
+        for it in (items or [])[:Config.XAI_MAX_INPUT_ITEMS]:
+            t = str(it.get("title", "") or "").strip()
+            s = str(it.get("snippet", "") or "").strip()
+            u = str(it.get("url", "") or "").strip()
+            if not (t or s):
+                continue
+            line = f"- TITLE: {t[:160]}\n  SNIPPET: {s[:Config.XAI_MAX_TEXT_CHARS_PER_ITEM]}\n  URL: {u[:220]}"
+            trimmed.append(line)
+
+        blob = "\n".join(trimmed).strip()
+        if not blob:
+            blob = "(no items)"
+
+        return f"""
+You are an OSINT summarizer.
+DATE: {date_str}
+
+TASK:
+Summarize the main publicly-visible topics and narratives for this date based ONLY on the collected items.
+Do NOT forecast, do NOT provide tactical/operational advice, do NOT suggest harmful actions.
+Be concise and factual.
+
+Return STRICT JSON ONLY with this schema:
+{{
+  "summary": "2-5 sentences",
+  "top_topics": [{{"topic":"...", "notes":"..."}}, ...],
+  "source_mix": {{"x_items": <int>, "web_items": <int>}},
+  "caveats": ["..."]
+}}
+
+ITEMS:
+{blob}
+""".strip()
+
+    @retry_with_backoff(retries=Config.MAX_RETRIES, base=1.0)
+    def summarize_day(
+        self,
+        date_obj: datetime.date,
+        items: List[Dict[str, Any]],
+        model: str,
+        temperature: float
+    ) -> Tuple[Dict[str, Any], bool]:
+        date_str = date_obj.strftime("%Y-%m-%d")
+        fp = self._items_fingerprint(items)
+        query_hash = hashlib.md5((date_str + fp + model + str(temperature) + Config.VERSION_TAG).encode("utf-8")).hexdigest()
+
+        cached = db_manager.get_data(date_str, "GROK_" + query_hash)
+        if cached:
+            return cached, True
+
+        prompt = self._build_prompt(date_str, items)
+
+        url = Config.XAI_API_BASE + Config.XAI_CHAT_COMPLETIONS_ENDPOINT
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {self.api_key}",
+        }
+        payload = {
+            "messages": [{"role": "user", "content": prompt}],
+            "model": model,
+            "stream": False,
+            "temperature": float(temperature),
+        }
+
+        self.rate.acquire()
+        r = requests.post(url, headers=headers, data=json.dumps(payload), timeout=Config.XAI_TIMEOUT_SEC)
+
+        if r.status_code == 429:
+            raise RuntimeError("XAI_RATE_LIMIT_429")
+        if r.status_code >= 400:
+            raise RuntimeError(f"XAI_HTTP_{r.status_code}: {r.text[:300]}")
+
+        resp = r.json()
+
+        # expected shape similar to OpenAI-style chat completions
+        text = ""
+        try:
+            text = resp["choices"][0]["message"]["content"]
+        except Exception:
+            text = ""
+
+        parsed = extract_json_object(text)
+        if not isinstance(parsed, dict) or not parsed:
+            parsed = {
+                "summary": (text or "")[:1200],
+                "top_topics": [],
+                "source_mix": {"x_items": 0, "web_items": 0},
+                "caveats": ["non_strict_json_response"],
+            }
+
+        out = {
+            "error": None,
+            "debug": {"date": date_str, "model": model, "temperature": float(temperature)},
+            "result": parsed,
+        }
+
+        db_manager.save_data(date_str, "GROK_" + query_hash, out)
+        return out, False
 
 
 # =========================
@@ -781,7 +1030,7 @@ analyzer = get_analyzer()
 
 
 # =========================
-# Timeline metrics (trend/anomaly/correlation)
+# Timeline metrics
 # =========================
 def pearson_corr(a: List[float], b: List[float]) -> float:
     if not a or not b:
@@ -826,8 +1075,8 @@ def build_assessment(live_rows: List[Dict[str, Any]], kpis: Dict[str, Any]) -> s
 
     if max_score == 0.0 and avg_conf == 0.0:
         return (
-            "לא אותר סיגנל תקשורתי מאומת בטווח הנבדק. "
-            "אם זה לא הגיוני מול המציאות, בדוק: מילות מפתח, מצב אימות (Strict/Relaxed), ומכסת API."
+            "לא אותר סיגנל תקשורתי בטווח הנבדק. "
+            "אם זה לא הגיוני מול המציאות, בדוק: מילות מפתח, מצב איסוף/אימות, ומכסת API."
         )
 
     lines = []
@@ -845,7 +1094,7 @@ def build_assessment(live_rows: List[Dict[str, Any]], kpis: Dict[str, Any]) -> s
 
 
 # =========================
-# Secrets / Access (No UI API key input)
+# Secrets / Access
 # =========================
 GOOGLE_API_KEY = st.secrets.get("GOOGLE_API_KEY", "")
 if not GOOGLE_API_KEY:
@@ -872,17 +1121,50 @@ with st.sidebar:
     live_anchor = st.date_input("תאריך נוכחי (Live):", datetime.date(2025, 12, 28))
     window_days = st.slider("חלון סריקה (ימים):", 7, 45, 20)
 
-    est_calls = (window_days + 1) * 2
-    st.caption(f"📊 צפי קריאות API: {est_calls} (במקביליות: {Config.MAX_WORKERS})")
-    if est_calls > 60:
-        st.markdown("<span class='metric-warning'>⚠️ שים לב ל-Quota</span>", unsafe_allow_html=True)
+    st.divider()
+    st.subheader("✅ מצב איסוף/אימות")
+    validation_mode = st.radio("מצב:", ["Collect", "Strict", "Relaxed"], index=0)
+    keywords = st.text_input("מילות חיפוש (WEB/Gemini):", "Iran Israel military conflict missile attack nuclear")
 
     st.divider()
-    validation_mode = st.radio("רמת אימות:", ["Strict", "Relaxed"], index=1)
-    keywords = st.text_input("מילות חיפוש:", "Iran Israel military conflict missile attack nuclear")
+    st.subheader("𝕏 שלב 1: X API")
+    include_x = st.checkbox("לשלב X API בשלב הראשון", value=True)
+    x_query = st.text_input(
+        "שאילתת X (query):",
+        value="(Iran OR Israel) (missile OR nuclear OR attack OR military) -is:retweet lang:en"
+    )
+    use_full_archive = st.checkbox("X Full-Archive (/search/all) אם יש הרשאה", value=False)
+
+    st.divider()
+    st.subheader("🤖 שלב 3: Grok (x.ai) סיכום יומי")
+    include_grok = st.checkbox("להפעיל Grok לסיכום יומי (לא תחזיות)", value=False)
+    grok_model = st.text_input("Model", value=Config.XAI_DEFAULT_MODEL)
+    grok_temperature = st.slider("Temperature", 0.0, 1.0, 0.7, 0.1)
 
     st.divider()
     show_debug = st.checkbox("הצג Debug לכל יום", value=False)
+
+    # estimate calls (rough)
+    days_total = (window_days + 1) * 2  # ref + live
+    est_calls = days_total  # WEB per day
+    if include_x:
+        est_calls += days_total  # X per day (ignoring pagination)
+    if include_grok:
+        est_calls += days_total  # Grok per day
+    st.caption(f"📊 צפי קריאות API (גס): {est_calls}  | מקביליות: {Config.MAX_WORKERS}")
+    if est_calls > 80:
+        st.markdown("<span class='metric-warning'>⚠️ שים לב ל-Quota</span>", unsafe_allow_html=True)
+
+# load X + XAI secrets only if enabled
+X_BEARER_TOKEN = st.secrets.get("X_BEARER_TOKEN", "")
+if include_x and not X_BEARER_TOKEN:
+    st.error("חסר X_BEARER_TOKEN ב־Streamlit Secrets. (Settings → Secrets)")
+    st.stop()
+
+XAI_API_KEY = st.secrets.get("XAI_API_KEY", "")
+if include_grok and not XAI_API_KEY:
+    st.error("חסר XAI_API_KEY ב־Streamlit Secrets. (Settings → Secrets)")
+    st.stop()
 
 
 # =========================
@@ -892,16 +1174,82 @@ with st.sidebar:
 def get_rate_limiter() -> GlobalRateLimiter:
     return GlobalRateLimiter(min_interval=Config.MIN_INTERVAL_SEC, jitter=Config.JITTER_SEC)
 
+
 rate_limiter = get_rate_limiter()
 
 
-def process_day(scanner: GeminiScanner, d: datetime.date, keywords_: str, mode_: str) -> Dict[str, Any]:
-    raw_data, cached = scanner.fetch_day(d, keywords_, mode_)
-    analytics = analyzer.analyze(raw_data.get("items", []))
+def process_day(
+    scanner: GeminiScanner,
+    xscanner: Optional[XScanner],
+    grok: Optional[GrokSummarizer],
+    d: datetime.date,
+    keywords_: str,
+    x_query_: str,
+    mode_: str,
+    include_x_: bool,
+    use_full_archive_: bool,
+    include_grok_: bool,
+    grok_model_: str,
+    grok_temp_: float,
+) -> Dict[str, Any]:
+
+    # Stage 1: X
+    x_raw = {"error": "X_DISABLED", "debug": {"date": d.isoformat()}, "items": []}
+    x_cached = False
+    if include_x_ and xscanner is not None and x_query_.strip():
+        x_raw, x_cached = xscanner.fetch_day(d, x_query_, use_full_archive_)
+
+    # Stage 2: Gemini Flash (Web)
+    web_raw, web_cached = scanner.fetch_day(d, keywords_, mode_)
+
+    # Combined daily "data lake" (no mandatory cross-validation)
+    combined_items = (x_raw.get("items", []) or []) + (web_raw.get("items", []) or [])
+
+    combined_error = None
+    if x_raw.get("error") and x_raw.get("error") not in ("X_DISABLED", None, ""):
+        combined_error = f"X:{x_raw.get('error')}"
+    if web_raw.get("error"):
+        combined_error = (combined_error + " | " if combined_error else "") + f"WEB:{web_raw.get('error')}"
+
+    combined_raw = {
+        "error": combined_error,
+        "debug": {
+            "date": d.isoformat(),
+            "mode": mode_,
+            "x": x_raw.get("debug", {}),
+            "web": web_raw.get("debug", {}),
+            "x_items": int(len(x_raw.get("items", []) or [])),
+            "web_items": int(len(web_raw.get("items", []) or [])),
+        },
+        "items": combined_items,
+        "sources": {"x": x_raw, "web": web_raw},
+    }
+
+    analytics = analyzer.analyze(combined_raw.get("items", []))
+
+    # Stage 3: Grok daily summary (optional)
+    grok_out = {"error": "GROK_DISABLED", "debug": {"date": d.isoformat()}, "result": {}}
+    grok_cached = False
+    if include_grok_ and grok is not None:
+        try:
+            grok_out, grok_cached = grok.summarize_day(d, combined_items, model=grok_model_, temperature=grok_temp_)
+        except Exception as e:
+            grok_out = {"error": str(e), "debug": {"date": d.isoformat()}, "result": {}}
+
+    combined_raw["grok"] = grok_out
+    combined_raw["debug"]["grok_cached"] = bool(grok_cached)
+
+    # Cached: if X is off -> web only; if grok on -> all should be cached to be "cached"
+    cached = web_cached
+    if include_x_:
+        cached = cached and x_cached
+    if include_grok_:
+        cached = cached and grok_cached
+
     return {
         "date_obj": d,
         "date_label": d.strftime("%d/%m"),
-        "raw": raw_data,
+        "raw": combined_raw,
         "analytics": analytics,
         "cached": cached,
     }
@@ -914,6 +1262,14 @@ def run_scan() -> Dict[str, Any]:
         pool_size=max(2, Config.MAX_WORKERS),
     )
 
+    xscanner = None
+    if include_x:
+        xscanner = XScanner(bearer_token=X_BEARER_TOKEN, rate_limiter=rate_limiter)
+
+    grok = None
+    if include_grok:
+        grok = GrokSummarizer(api_key=XAI_API_KEY, rate_limiter=rate_limiter)
+
     ref_dates = [reference_anchor - datetime.timedelta(days=i) for i in range(window_days, -1, -1)]
     live_dates = [live_anchor - datetime.timedelta(days=i) for i in range(window_days, -1, -1)]
 
@@ -924,11 +1280,19 @@ def run_scan() -> Dict[str, Any]:
     prog = st.progress(0.0)
 
     results_map: Dict[str, Dict[str, Any]] = {}
-
     all_dates = [("Reference", d) for d in ref_dates] + [("Live", d) for d in live_dates]
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=Config.MAX_WORKERS) as ex:
-        futures = {ex.submit(process_day, scanner, d, keywords, validation_mode): (typ, d) for typ, d in all_dates}
+        futures = {
+            ex.submit(
+                process_day,
+                scanner, xscanner, grok,
+                d, keywords, x_query, validation_mode,
+                include_x, use_full_archive,
+                include_grok, grok_model, grok_temperature
+            ): (typ, d)
+            for typ, d in all_dates
+        }
 
         for fut in concurrent.futures.as_completed(futures):
             typ, d = futures[fut]
@@ -974,12 +1338,15 @@ def run_scan() -> Dict[str, Any]:
     export_obj = {
         "meta": {
             "generated_at": datetime.datetime.now().isoformat(),
-            "keywords": keywords,
+            "keywords_web": keywords,
+            "x_query": x_query,
             "validation_mode": validation_mode,
             "window_days": int(window_days),
             "reference_anchor": reference_anchor.isoformat(),
             "live_anchor": live_anchor.isoformat(),
             "models": {"flash": Config.FLASH_MODEL, "pro": Config.PRO_MODEL},
+            "x": {"enabled": bool(include_x), "full_archive": bool(use_full_archive)},
+            "grok": {"enabled": bool(include_grok), "model": grok_model, "temperature": float(grok_temperature)},
             "kpis": kpis,
         },
         "reference": [
@@ -1006,13 +1373,13 @@ def run_scan() -> Dict[str, Any]:
 
     db_manager.audit(
         action="scan_run",
-        query_hash=hashlib.md5((keywords + validation_mode + Config.VERSION_TAG).encode("utf-8")).hexdigest(),
+        query_hash=hashlib.md5((keywords + x_query + validation_mode + Config.VERSION_TAG).encode("utf-8")).hexdigest(),
         keywords=keywords,
         validation_mode=validation_mode,
         window_days=window_days,
         reference_anchor=reference_anchor.isoformat(),
         live_anchor=live_anchor.isoformat(),
-        meta={"kpis": kpis},
+        meta={"kpis": kpis, "x": {"enabled": include_x, "full_archive": use_full_archive}, "grok": {"enabled": include_grok}},
     )
 
     return {
@@ -1024,6 +1391,9 @@ def run_scan() -> Dict[str, Any]:
     }
 
 
+# =========================
+# UI Controls
+# =========================
 if "scan_state" not in st.session_state:
     st.session_state.scan_state = None
 
@@ -1039,7 +1409,7 @@ if clear_btn:
 
 if run_btn:
     if not keywords.strip():
-        st.error("מילות חיפוש ריקות.")
+        st.error("מילות חיפוש ריקות (WEB).")
     else:
         st.session_state.scan_state = run_scan()
 
@@ -1054,6 +1424,7 @@ kpis = state["kpis"]
 anom_idxs = state["live_anomaly_indices"]
 export_obj = state["export_obj"]
 
+
 # =========================
 # KPI cards
 # =========================
@@ -1062,6 +1433,7 @@ k1.metric("Correlation (Ref↔Live)", f"{kpis['correlation']:.2f}")
 k2.metric("Avg Confidence (Live)", f"{kpis['avg_confidence_live']:.2f}")
 k3.metric("Live Max Score", f"{kpis['live_max_score']:.2f}")
 k4.metric(f"Live Anomalies (|z|≥{Config.ANOMALY_Z_ABS:g})", f"{kpis['live_anomaly_count']}")
+
 
 # =========================
 # Trend chart
@@ -1109,6 +1481,7 @@ if anom_idxs:
     })
     st.dataframe(adf, use_container_width=True, hide_index=True)
 
+
 # =========================
 # Evidence Locker
 # =========================
@@ -1130,6 +1503,16 @@ def render_timeline(timeline: List[Dict[str, Any]]):
             title += f" | ⚠️ {err}"
 
         with st.expander(title, expanded=False):
+            # show grok (optional)
+            grok_obj = (day["raw"].get("grok") or {})
+            grok_err = grok_obj.get("error")
+            grok_res = grok_obj.get("result") or {}
+            if include_grok and (grok_err is None or grok_err == "") and grok_res:
+                st.markdown(
+                    f"<div class='grok-box'><b>Grok סיכום יומי:</b><br>{str(grok_res.get('summary','')).strip()}</div>",
+                    unsafe_allow_html=True
+                )
+
             for cl in day["analytics"].get("top_clusters", [])[:3]:
                 st.markdown(
                     f"<div class='cluster-card'><b>{cl['main_title']}</b><br>"
@@ -1139,7 +1522,7 @@ def render_timeline(timeline: List[Dict[str, Any]]):
 
             ev = day["analytics"].get("evidence", [])
             if not ev:
-                st.caption("אין ראיות מאומתות ליום הזה.")
+                st.caption("אין ראיות מסוננות ליום הזה.")
             else:
                 for e in ev:
                     tier = "Tier1" if e.get("is_tier1") else "Other"
@@ -1151,6 +1534,10 @@ def render_timeline(timeline: List[Dict[str, Any]]):
             if show_debug:
                 st.markdown("<div class='debug-info'>", unsafe_allow_html=True)
                 st.write("debug:", debug)
+                if include_grok:
+                    st.write("grok_debug:", grok_obj.get("debug", {}))
+                    if grok_err and grok_err not in ("GROK_DISABLED", None, ""):
+                        st.write("grok_error:", grok_err)
                 st.markdown("</div>", unsafe_allow_html=True)
 
 
@@ -1160,11 +1547,13 @@ with tab1:
 with tab2:
     render_timeline(live_timeline)
 
+
 # =========================
 # Assessment (deterministic, no forecasting)
 # =========================
 st.subheader("🧠 הערכת מצב (OSINT בלבד)")
 st.write(build_assessment(live_timeline, kpis))
+
 
 # =========================
 # Export
@@ -1182,6 +1571,11 @@ st.download_button(
 
 rows = []
 for day in (ref_timeline + live_timeline):
+    dbg = (day["raw"].get("debug") or {})
+    web_dbg = (dbg.get("web") or {})
+    x_dbg = (dbg.get("x") or {})
+    grok_dbg = (day["raw"].get("grok") or {}).get("debug", {}) or {}
+
     rows.append({
         "type": day["type"],
         "date": day["date_obj"].isoformat(),
@@ -1194,9 +1588,13 @@ for day in (ref_timeline + live_timeline):
         "unique_domains": int(day["analytics"]["valid_unique_domains"]),
         "cached": bool(day["cached"]),
         "error": str(day["raw"].get("error") or ""),
-        "raw_items": int((day["raw"].get("debug") or {}).get("raw_items", 0) or 0),
-        "validated": int((day["raw"].get("debug") or {}).get("validated", 0) or 0),
-        "strict_fallback_hits": int((day["raw"].get("debug") or {}).get("strict_fallback_hits", 0) or 0),
+        "x_items": int(dbg.get("x_items", 0) or 0),
+        "web_items": int(dbg.get("web_items", 0) or 0),
+        "web_raw_items": int(web_dbg.get("raw_items", 0) or 0),
+        "web_validated": int(web_dbg.get("validated", 0) or 0),
+        "x_pages": int(x_dbg.get("pages", 0) or 0),
+        "grok_model": str(grok_dbg.get("model", "") or ""),
+        "grok_temp": float(grok_dbg.get("temperature", 0.0) or 0.0),
     })
 
 summary_df = pd.DataFrame(rows).sort_values(["type", "day_offset"])
